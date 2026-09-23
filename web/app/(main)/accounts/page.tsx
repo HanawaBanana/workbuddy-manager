@@ -39,6 +39,7 @@ import {AddAccountDialog} from '@/components/common/accounts/AddAccountDialog';
 import {CreditCountdown} from '@/components/common/accounts/CreditCountdown';
 import {AccountNoteDialog} from '@/components/common/accounts/AccountNoteDialog';
 import {AccountTaskDialog} from '@/components/common/accounts/AccountTaskDialog';
+import {AccountUsageDialog} from '@/components/common/accounts/AccountUsageDialog';
 import {useAuth} from '@/lib/auth-context';
 import {realmLabel, useRealm} from '@/lib/realm-context';
 import {useT} from '@/lib/i18n/provider';
@@ -66,6 +67,8 @@ export default function AccountsPage() {
   const [noteTarget, setNoteTarget] = useState<Account | null>(null);
   // 活动任务（单账号执行成长任务）的目标账号；null = 对话框关闭
   const [taskTarget, setTaskTarget] = useState<Account | null>(null);
+  // 积分详情（用分单价 + 套餐到期）的目标账号
+  const [usageTarget, setUsageTarget] = useState<Account | null>(null);
   const [busyFile, setBusyFile] = useState<string | null>(null);
   const [checkinAllBusy, setCheckinAllBusy] = useState(false);
   /** 每个账号积分是实时查询还是命中缓存（含缓存已存在秒数） */
@@ -521,9 +524,16 @@ export default function AccountsPage() {
           : 'text-foreground';
     return (
       <span className="inline-flex items-center gap-1.5">
-        <span className={`text-xs font-medium tabular-nums ${tone}`} title={t('accounts.creditsTitle')}>
+        {/* 数字本身是入口：点开看「这些分是怎么用掉的」（各模型实测单价 + 套餐到期）。
+            只给余额不给去处，用户只能看到「少了」却看不出「少在哪」。 */}
+        <button
+          type="button"
+          className={`text-xs font-medium tabular-nums underline-offset-2 hover:underline ${tone}`}
+          title={t('accounts.usageOpen')}
+          onClick={() => setUsageTarget(a)}
+        >
           {fmtNumber(value)}
-        </span>
+        </button>
         {fromSnapshot ? (
           <span
             className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] leading-3 text-muted-foreground"
@@ -976,6 +986,13 @@ export default function AccountsPage() {
         open={taskTarget !== null}
         onOpenChange={(open) => { if (!open) setTaskTarget(null); }}
         onFinished={load}
+      />
+      <AccountUsageDialog
+        account={usageTarget}
+        open={usageTarget !== null}
+        onOpenChange={(open) => { if (!open) setUsageTarget(null); }}
+        credits={usageTarget ? liveCredits[usageTarget.uid] : undefined}
+        meta={usageTarget ? creditsMeta[usageTarget.uid] : undefined}
       />
     </div>
   );

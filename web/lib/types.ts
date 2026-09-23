@@ -46,6 +46,13 @@ export interface Account {
    * 已签到态，避免重复点击（详见 server/routers/accounts.py 的 `_today_start`）。
    */
   checkin_today?: number | null;
+  /**
+   * 该账号在各模型上的**实测单价**台账（上游的可观测性数据），按单价从高到低。
+   *
+   * 口径：这是**单价**（每千 token 扣多少分），不是消耗总量。「哪个模型贵」
+   * 与「哪个用得最多」是两件事 —— 界面文案必须把这个说清，否则会被读反。
+   */
+  model_costs?: ModelCost[];
   rate_limited_models?: {
     model: string;
     /** 该模型的冷却截止（已被 soft_rate_max 截断） */
@@ -488,6 +495,23 @@ export interface CreditExpiry {
   at: number;
   /** 该套餐当前的可用额度 */
   amount: number;
+}
+
+/**
+ * 单个账号在单个模型上的成本观测（上游 `model_costs` 的一项）。
+ *
+ * 上游用实际调用返回的扣费与 token 数反推单价，并做 EMA 平滑，所以它是
+ * **实测值**而不是价目表：同一个模型在不同账号上可能差几十倍。
+ * 三个字段都可能缺失（上游只在观测到之后才记录，且观测有有效期）。
+ */
+export interface ModelCost {
+  model: string;
+  /** 实测单价：每千 token 扣多少积分（EMA 平滑）；null = 未采集到；≤0 = 实测免费 */
+  cost_per_1k: number | null;
+  /** 最近一次观测时刻（RFC3339）；null = 未采集到 */
+  last_seen: string | null;
+  /** 参与平滑的样本数（**不是**总调用次数）；null = 未采集到 */
+  samples: number | null;
 }
 
 /** 积分查询来源：实时查询 or 命中 60 秒缓存 */

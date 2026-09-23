@@ -192,6 +192,39 @@ def list_auth_accounts() -> list[dict]:
     return out
 
 
+def _norm_model_costs(raw: object) -> list[dict]:
+    """把上游的 `model_costs` 洗成前端可直接渲染的列表，按单价从高到低。
+
+    上游给的是 `[{model, cost_per_1k, last_seen, samples}]`：该账号在这个模型上的
+    **实测单价**（EMA 平滑值，≤0 表示实测免费）与最近观测时刻。
+
+    为什么要逐项校验：这些数字会直接显示给用户（用户拿它判断「哪个号在烧分」），
+    而它们的形态由上游决定。类型不符的行宁可丢掉，也不要让 `None` 渗透到
+    `toFixed()` 里把整页弄崩——最坏是少显示一行。
+
+    排序按单价降序：用户最想先看到的是「哪个模型最贵」。单价缺失的行排在最后
+    （缺数据不等于便宜）。
+    """
+    if not isinstance(raw, list):
+        return []
+    out: list[dict] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        model = str(item.get('model') or '').strip()
+        if not model:
+            continue
+        cost = item.get('cost_per_1k')
+        cost = float(cost) if isinstance(cost, (int, float)) and not isinstance(cost, bool) else None
+        seen = item.get('last_seen')
+        seen = seen if isinstance(seen, str) and seen else None
+        samples = item.get('samples')
+        samples = int(samples) if isinstance(samples, int) and not isinstance(samples, bool) else None
+        out.append({'model': model, 'cost_per_1k': cost, 'last_seen': seen, 'samples': samples})
+    out.sort(key=lambda x: (x['cost_per_1k'] is None, -(x['cost_per_1k'] or 0.0)))
+    return out
+
+
 def merge_pool_status(accounts: list[dict], status: dict) -> list[dict]:
     """把 /status 的运行时状态合并进账号列表（含积分余额）。
 
@@ -222,6 +255,9 @@ def merge_pool_status(accounts: list[dict], status: dict) -> list[dict]:
             # 上游未返回该账号：可能刚添加尚未重载，也可能上游根本没加载成功。
             # 保持其余字段为 None（前端据此单独展示，而不是当成「在线」）。
             a.setdefault('credits', None)
+            # 台账同样给空列表而不是留空：界面的积分详情弹窗直接读它渲染空态，
+            # 缺字段会让两处视图各写一次判空（且漏一处就是 undefined 渲染）。
+            a['model_costs'] = []
             # 本面板**主动禁用**的账号必然不在池里（改名后上游不再加载它）——
             # 这是预期行为，不是故障。把原因写清楚，否则界面会按「上游没加载它」
             # 报成「账号文件可能有问题」，用户看到自己刚禁用的账号被标成疑似损坏，
@@ -284,6 +320,17 @@ def merge_pool_status(accounts: list[dict], status: dict) -> list[dict]:
         # 标出来，用户才知道该重新登录或删掉它。
         a['err_total'] = p.get('err_total')
         a['last_err'] = p.get('last_err')
+        # 实测成本台账（上游 P1-anti-monopoly 的可观测性数据）：该账号在每个模型上
+        # 的实测单价与最近观测时刻。
+        #
+        # 为什么值得透出：同一个模型在不同账号上的计价能差**几十倍**（线上实测
+        # deepseek-v4-flash：0.0087 / 0.0490 / 0.0926 每千 token），而这正是
+        # 「为什么这个号掉分特别快」的答案 —— 此前只有上游的 state.json 里有，
+        # 界面完全看不到，用户只能猜。
+        #
+        # 口径提醒（前端文案必须跟上）：这是**单价**，不是「一共花了多少分」。
+        # 把它读成消耗量会得出完全相反的结论（贵 ≠ 用得多）。
+        a['model_costs'] = _norm_model_costs(p.get('model_costs'))
     return accounts
 
 
