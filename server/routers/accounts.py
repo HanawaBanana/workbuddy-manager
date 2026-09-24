@@ -422,7 +422,7 @@ async def account_usage(uid: str, user: dict = Depends(security.current_user)) -
         }
 
     models = db.query(
-        'SELECT COALESCE(NULLIF(mapped_model, ''), model) AS model, COUNT(*) AS requests, '
+        "SELECT COALESCE(NULLIF(mapped_model, ''), model) AS model, COUNT(*) AS requests, "
         'COALESCE(SUM(prompt_tokens),0)+COALESCE(SUM(completion_tokens),0) AS tokens, '
         'SUM(credit) AS credit '
         'FROM request_logs WHERE uid = ? AND status < 400 AND ts >= ? '
