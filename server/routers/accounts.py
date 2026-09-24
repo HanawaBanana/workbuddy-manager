@@ -429,6 +429,7 @@ async def account_usage(uid: str, user: dict = Depends(security.current_user)) -
         'GROUP BY 1 ORDER BY tokens DESC LIMIT 5',
         (uid, d30),
     ) or []
+    models = [dict(m) for m in models]  # sqlite3.Row 无法被 FastAPI 序列化
 
     return {
         'uid': uid,
