@@ -432,8 +432,8 @@ async def account_usage(uid: str, user: dict = Depends(security.current_user)) -
 
     return {
         'uid': uid,
-        'all': _sum('', ()),
-        'days30': _sum('ts >= ?', (d30,)),
+        'all': _sum('', (uid,)),
+        'days30': _sum('ts >= ?', (uid, d30)),
         'models': models,
     }
 
