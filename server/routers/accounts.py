@@ -406,7 +406,9 @@ async def account_usage(uid: str, user: dict = Depends(security.current_user)) -
             'MIN(ts) AS first_ts, MAX(ts) AS last_ts '
             f'FROM request_logs WHERE uid = ? AND status < 400 AND {where}',
             args,
-        ) or {}
+        )
+        # sqlite3.Row 没有 .get()，先转 dict（无行时给空 dict）
+        row = dict(row) if row else {}
         return {
             'requests': row.get('requests') or 0,
             'prompt_tokens': row.get('pt') or 0,

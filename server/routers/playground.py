@@ -118,6 +118,7 @@ async def chat(body: ChatIn, request: Request, user: dict = Depends(security.req
             int(usage.get('completion_tokens') or 0),
             int((time.time() - started) * 1000),
             request.headers.get('user-agent'), None, False,
+            uid=resp.headers.get('x-wb-account'),
             usage=usage,
         )
         return StreamingResponse(iter([raw]), media_type='application/json',
@@ -157,8 +158,8 @@ async def chat(body: ChatIn, request: Request, user: dict = Depends(security.req
                 int(usage.get('completion_tokens') or 0),
                 int((time.time() - started) * 1000),
                 request.headers.get('user-agent'), error_text, True,
-                usage=usage,
-                first_token=first_token_ms,
+                usage=usage, first_token=first_token_ms,
+                uid=resp.headers.get('x-wb-account'),
             )
 
     return StreamingResponse(gen(), status_code=resp.status_code,
