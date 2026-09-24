@@ -1,6 +1,7 @@
 'use client';
 
-import {Coins, Info, Sparkles} from 'lucide-react';
+import {useEffect, useState} from 'react';
+import {Coins, History, Info, Loader2, Sparkles} from 'lucide-react';
 import {
   Dialog,
   DialogContent,
@@ -11,7 +12,8 @@ import {
 import {useT} from '@/lib/i18n/provider';
 import {RichText} from '@/lib/i18n/rich-text';
 import {fmtDateTime, fmtNumber} from '@/lib/format';
-import type {Account, CreditsMeta} from '@/lib/types';
+import {accountApi} from '@/lib/api';
+import type {Account, AccountUsageSummary, CreditsMeta} from '@/lib/types';
 
 /**
  * 账号「积分详情」弹窗：**这个号的分花在哪儿、还有多少要过期**。
@@ -49,6 +51,29 @@ export function AccountUsageDialog({
 
   const uid = account?.uid ?? '';
   const models = account?.model_costs ?? [];
+  // 消耗总量：request_logs 按 uid 聚合。弹窗打开时拉一次即可（数字只在有
+  // 新请求时才变化，轮询没有意义）。
+  const [usage, setUsage] = useState<AccountUsageSummary | null>(null);
+  const [usageLoading, setUsageLoading] = useState(false);
+  useEffect(() => {
+    if (!open || !uid) return;
+    let alive = true;
+    setUsageLoading(true);
+    accountApi
+      .usage(uid)
+      .then((u) => {
+        if (alive) setUsage(u);
+      })
+      .catch(() => {
+        /* 拉不到就不显示该段（旁路数据，不打扰主功能） */
+      })
+      .finally(() => {
+        if (alive) setUsageLoading(false);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [open, uid]);
   const expiries = meta?.expiries ?? [];
   // 与账号列表同一口径：优先实时值，其次上游 /status 的快照
   const live = credits === undefined ? undefined : credits;
@@ -98,6 +123,51 @@ export function AccountUsageDialog({
               )}
             </span>
           </div>
+
+          {/* 消耗总量：这个号实际花了多少（此前只有单价没有总量） */}
+          <section className="space-y-1.5">
+            <div className="flex items-center gap-1.5">
+              <History className="size-3.5 text-muted-foreground" />
+              <span className="text-[12px] font-medium">{t('accounts.usageSpendTitle')}</span>
+              {usageLoading && <Loader2 className="size-3 animate-spin text-muted-foreground" />}
+            </div>
+            {usage && usage.all.requests > 0 ? (
+              <div className="space-y-1.5">
+                {(
+                  [
+                    ['accounts.usageSpendAll', usage.all],
+                    ['accounts.usageSpend30d', usage.days30],
+                  ] as const
+                ).map(([label, u]) => (
+                  <div key={label} className="rounded-xl bg-muted px-3 py-2 text-[11px]">
+                    <div className="flex items-center justify-between">
+                      <span className="text-muted-foreground">{t(label)}</span>
+                      <span className="font-medium tabular-nums">
+                        {t('accounts.usageSpendRequests', {n: u.requests})}
+                      </span>
+                    </div>
+                    <div className="mt-0.5 flex items-center justify-between text-muted-foreground">
+                      <span className="tabular-nums">
+                        {fmtNumber(u.prompt_tokens + u.completion_tokens)} tokens
+                      </span>
+                      <span className="tabular-nums">
+                        {u.credit === null
+                          ? '—'
+                          : t('accounts.usageSpendCredit', {credit: Math.round(u.credit * 100) / 100})}
+                      </span>
+                    </div>
+                  </div>
+                ))}
+                <p className="text-[10px] leading-relaxed text-muted-foreground/80">
+                  {t('accounts.usageSpendNote')}
+                </p>
+              </div>
+            ) : (
+              <div className="rounded-xl bg-muted px-3 py-2.5 text-[11px] leading-relaxed text-muted-foreground">
+                {t('accounts.usageSpendNoData')}
+              </div>
+            )}
+          </section>
 
           {/* 用分单价台账 */}
           <section className="space-y-1.5">

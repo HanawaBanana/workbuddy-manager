@@ -381,6 +381,59 @@ async def account_checkin(filename: str, user: dict = Depends(security.require_a
     }
 
 
+@router.get('/accounts/{uid}/usage')
+async def account_usage(uid: str, user: dict = Depends(security.current_user)) -> dict:
+    """单个账号的消耗总量（按 uid 聚合 request_logs）。
+
+    为什么是现在才有：request_logs 此前没有 uid 列——上游选号对网关完全不
+    可见，每次请求"走了哪个号"无从知晓。2api 在成功响应的 X-Wb-Account 头里
+    带回实际服务的账号后（2026-09-24 起），这里才能算得准。
+
+    口径：
+      * 只统计**成功请求**（status < 400）——token 与扣费只有成功响应才有；
+      * `credit` 为 NULL 表示该时段**没有可计费的观测**（全部失败，或行记录
+        早于 credit 采集），与「扣了 0」是两回事；
+      * 上线时刻之前的请求没有 uid，不计入——总量从零开始累计。
+    """
+    uid = db._clean(uid, 64)
+    now = int(time.time())
+    d30 = now - 30 * 86400
+
+    def _sum(where: str, args: tuple) -> dict:
+        row = db.query_one(
+            'SELECT COUNT(*) AS requests, COALESCE(SUM(prompt_tokens),0) AS pt, '
+            'COALESCE(SUM(completion_tokens),0) AS ct, SUM(credit) AS credit, '
+            'MIN(ts) AS first_ts, MAX(ts) AS last_ts '
+            f'FROM request_logs WHERE uid = ? AND status < 400 AND {where}',
+            args,
+        ) or {}
+        return {
+            'requests': row.get('requests') or 0,
+            'prompt_tokens': row.get('pt') or 0,
+            'completion_tokens': row.get('ct') or 0,
+            # 全为 NULL（无观测）时保持 None，前端显示「无数据」而不是 0
+            'credit': row.get('credit'),
+            'first_ts': row.get('first_ts'),
+            'last_ts': row.get('last_ts'),
+        }
+
+    models = db.query(
+        'SELECT COALESCE(NULLIF(mapped_model, ''), model) AS model, COUNT(*) AS requests, '
+        'COALESCE(SUM(prompt_tokens),0)+COALESCE(SUM(completion_tokens),0) AS tokens, '
+        'SUM(credit) AS credit '
+        'FROM request_logs WHERE uid = ? AND status < 400 AND ts >= ? '
+        'GROUP BY 1 ORDER BY tokens DESC LIMIT 5',
+        (uid, d30),
+    ) or []
+
+    return {
+        'uid': uid,
+        'all': _sum('', ()),
+        'days30': _sum('ts >= ?', (d30,)),
+        'models': models,
+    }
+
+
 @router.get('/accounts/{filename}/credits')
 async def account_credits(
     filename: str,

@@ -282,7 +282,7 @@ def _usage_cache(usage: dict | None) -> tuple[int | None, int | None, int | None
             _one('prompt_cache_write_tokens'))
 
 
-def _record(key: dict | None, ip: str, model: str, mapped: str, status: int, pt: int, ct: int, latency: int, ua: str | None, error: str | None, stream: bool, *, credit: float | None = None, first_token: int | None = None, usage: dict | None = None) -> None:
+def _record(key: dict | None, ip: str, model: str, mapped: str, status: int, pt: int, ct: int, latency: int, ua: str | None, error: str | None, stream: bool, *, credit: float | None = None, first_token: int | None = None, usage: dict | None = None, uid: str | None = None) -> None:
     """记录调用日志与用量。
 
     credit 为上游返回的真实扣费（usage.credit）。None 表示上游没给，
@@ -341,6 +341,7 @@ def _record(key: dict | None, ip: str, model: str, mapped: str, status: int, pt:
             cache_hit_tokens=cache_hit,
             cache_miss_tokens=cache_miss,
             cache_write_tokens=cache_write,
+            uid=db._clean(uid, 64) if uid else None,
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning('写入请求日志失败（不影响请求）: %s', exc)
@@ -691,6 +692,7 @@ async def _chat(request: Request, upstream_path: str):
             _record(
                 key, ip, requested_model or '', mapped or '', resp.status_code, pt, ct,
                 latency, ua, error, False, usage=usage,
+                uid=resp.headers.get('x-wb-account'),
             )
             if data is not None:
                 return JSONResponse(data, status_code=resp.status_code)
@@ -713,6 +715,9 @@ async def _chat(request: Request, upstream_path: str):
 
     status_code = resp.status_code
     content_type = resp.headers.get('content-type', 'text/event-stream')
+    # 实际服务的上游账号：2api 在成功响应的 X-Wb-Account 头里带回（见 wb2api
+    # handler.go）。按账号的消耗总量靠它聚合——失败请求没有该头，记 NULL。
+    upstream_uid = resp.headers.get('x-wb-account')
 
     async def generator():
         usage: dict = {}
@@ -747,7 +752,7 @@ async def _chat(request: Request, upstream_path: str):
             _record(
                 key, ip, requested_model or '', mapped or '', status_code, pt, ct,
                 latency, ua, error_text, True, usage=usage,
-                first_token=first_token_ms,
+                first_token=first_token_ms, uid=upstream_uid,
             )
 
     return StreamingResponse(generator(), status_code=status_code, media_type=content_type)

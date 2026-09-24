@@ -4,6 +4,7 @@ import {tp} from './i18n';
 import type {Realm} from './realm-context';
 import type {
   Account,
+  AccountUsageSummary,
   CheckinLogPage,
   CreditExpiry,
   CreditsMeta,
@@ -97,6 +98,9 @@ export const authApi = {
 /* ── 账号 ───────────────────────────────────────────── */
 export const accountApi = {
   list: () => get<AccountsResponse>('/api/accounts'),
+  /** 单账号消耗总量（request_logs 按 uid 聚合；从功能上线起累计） */
+  usage: (uid: string) =>
+    get<AccountUsageSummary>(`/api/accounts/${encodeURIComponent(uid)}/usage`),
   /** 发起扫码登录；realm 决定国内版 / 国际版端点 */
   start: (realm: Realm = 'cn') =>
     post<{state: string; authUrl: string; realm: Realm}>('/api/auth/start', {realm}),

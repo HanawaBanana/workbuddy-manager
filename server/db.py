@@ -357,6 +357,11 @@ _MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ('request_logs', 'cache_hit_tokens', 'INTEGER'),
     ('request_logs', 'cache_miss_tokens', 'INTEGER'),
     ('request_logs', 'cache_write_tokens', 'INTEGER'),
+    # 实际服务的上游账号（uid）：上游在成功响应的 X-Wb-Account 头里带回，
+    # 网关转发时顺手记下。**可空**：历史记录没有；失败的请求没有（没选到号，
+    # 或上游错误信封不带该头）。按账号的消耗总量靠它聚合——此前只有「整个
+    # 池子花了多少」，答不出「这个号花了多少」。
+    ('request_logs', 'uid', 'TEXT'),
     ('api_keys', 'quota_credit', 'REAL NOT NULL DEFAULT 0'),
     ('api_keys', 'used_credit', 'REAL NOT NULL DEFAULT 0'),
     # 入站请求被拦的**原因**（issue #33）。
@@ -821,15 +826,16 @@ def add_request_log(**fields: object) -> None:
     execute(
         'INSERT INTO request_logs(ts, key_id, ip, model, mapped_model, status, '
         'prompt_tokens, completion_tokens, latency_ms, first_token_ms, ua, error, '
-        'stream, credit, realm, cache_hit_tokens, cache_miss_tokens, cache_write_tokens) '
-        'VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'stream, credit, realm, cache_hit_tokens, cache_miss_tokens, cache_write_tokens, uid) '
+        'VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
         (fields.get('ts'), fields.get('key_id'), fields.get('ip'),
          fields.get('model'), fields.get('mapped_model'), fields.get('status'),
          fields.get('prompt_tokens'), fields.get('completion_tokens'),
          fields.get('latency_ms'), fields.get('first_token_ms'), fields.get('ua'),
          fields.get('error'), fields.get('stream'), fields.get('credit'),
          fields.get('realm'), fields.get('cache_hit_tokens'),
-         fields.get('cache_miss_tokens'), fields.get('cache_write_tokens')),
+         fields.get('cache_miss_tokens'), fields.get('cache_write_tokens'),
+         fields.get('uid')),
     )
     _request_log_writes += 1
     if _request_log_writes >= _REQUEST_LOG_CHECK_EVERY:

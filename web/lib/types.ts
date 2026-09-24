@@ -5,6 +5,27 @@ export interface Me {
   role: Role;
 }
 
+/**
+ * 单账号消耗总量（/api/accounts/{uid}/usage）。request_logs 从 2026-09-24 起
+ * 才记录 uid，所以这里的数字从功能上线起累计——更早的请求不在其中。
+ */
+export interface UsageSum {
+  requests: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  /** 累计扣费；null = 该时段没有任何可计费观测（≠ 扣了 0） */
+  credit: number | null;
+  first_ts: number | null;
+  last_ts: number | null;
+}
+export interface AccountUsageSummary {
+  uid: string;
+  all: UsageSum;
+  days30: UsageSum;
+  /** 近 30 天按 token 排序的前 5 个模型 */
+  models: {model: string; requests: number; tokens: number; credit: number | null}[];
+}
+
 export interface Account {
   /** 该令牌签发的总时长（秒）；后端从 JWT 解出，解不出为 null */
   ttl_seconds?: number | null;
