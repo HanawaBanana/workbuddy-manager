@@ -55,7 +55,7 @@ import {
 } from '@/components/ui/table';
 
 export default function AccountsPage() {
-  const {realm, label: realmName} = useRealm();
+  const {realm} = useRealm();
   const t = useT();
   const {isAdmin} = useAuth();
   const [accounts, setAccounts] = useState<Account[]>([]);

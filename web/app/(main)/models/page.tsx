@@ -44,6 +44,24 @@ function fmtCtx(n: number): string {
 }
 
 /**
+ * 从积分倍率原文里取数值（"x0.05" / "x0.34 credits" 都有；取不出返回 null）。
+ * 模块级共用：排序和价格列都要用它，两处口径不一致就会出现「排序说最便宜、
+ * 列里却显示别的」这种自相矛盾。
+ */
+function parseCredits(v?: string): number | null {
+  const m = /x?\s*([0-9]+(?:\.[0-9]+)?)/i.exec(v || '');
+  return m ? Number(m[1]) : null;
+}
+
+/** 价格列的展示文本：x0.00 视为免费，原文带后缀（"x0.34 credits"）归一成 x0.34。 */
+function fmtCredits(v?: string): {text: string; num: number | null} {
+  const num = parseCredits(v);
+  if (num === null) return {text: '', num: null};
+  if (num === 0) return {text: 'free', num: 0};
+  return {text: `x${num}`, num};
+}
+
+/**
  * 系列标签配色（按系列名稳定取色，认不出的用中性色）。
  * 键是后端 modelcatalog 推导出的系列名，属固定的闭集。
  */
@@ -165,6 +183,10 @@ export default function ModelsPage() {
     }
   }, [realm]);
 
+  // 稳定引用：两个 useMemo（筛选排序、价格比例尺）都依赖它，
+  // 直接 `data?.models ?? []` 会在每次渲染生成新数组，useMemo 形同虚设。
+  const models = useMemo(() => data?.models ?? [], [data]);
+
   useEffect(() => {
     // 切版本时清掉筛选状态，避免「上一版的系列筛选把新版过滤成空」
     setSeries('all');
@@ -172,8 +194,6 @@ export default function ModelsPage() {
     setQ('');
     load();
   }, [load]);
-
-  const models = data?.models ?? [];
 
   const filtered = useMemo(() => {
     const kw = q.trim().toLowerCase();
@@ -192,13 +212,9 @@ export default function ModelsPage() {
     if (sort === 'credits') {
       // 倍率从低到高（越省越靠前）。**没有倍率的排在最后**——不是 0，
       // 不能当成「免费」混进最前面。
-      const num = (v?: string) => {
-        const m = /x?\s*([0-9]+(?:\.[0-9]+)?)/i.exec(v || '');
-        return m ? Number(m[1]) : null;
-      };
       return [...list].sort((a, b) => {
-        const na = num(a.credits);
-        const nb = num(b.credits);
+        const na = parseCredits(a.credits);
+        const nb = parseCredits(b.credits);
         if (na === null && nb === null) return 0;
         if (na === null) return 1;
         if (nb === null) return -1;
@@ -210,6 +226,15 @@ export default function ModelsPage() {
 
   const summary = data?.summary;
   const seriesOptions = summary?.series ?? [];
+  /** 当前清单里最大的倍率：给价格列的相对条形做比例尺（0 除外——那是免费） */
+  const maxCredits = useMemo(
+    () =>
+      models.reduce((max, m) => {
+        const n = parseCredits(m.credits);
+        return n !== null && n > max ? n : max;
+      }, 0),
+    [models],
+  );
 
   return (
     <div className="flex flex-col gap-4 md:gap-6">
@@ -382,6 +407,9 @@ export default function ModelsPage() {
                 <TableHeader>
                   <TableRow className="border-b border-border/60 hover:bg-transparent">
                     <TableHead className="pl-4 text-[11px] text-muted-foreground">{t('models.colModel')}</TableHead>
+                    <TableHead className="text-[11px] text-muted-foreground" title={t('models.creditRatioTitle')}>
+                      {t('models.colCredits')}
+                    </TableHead>
                     <TableHead className="text-[11px] text-muted-foreground">{t('models.colContext')}</TableHead>
                     <TableHead className="text-[11px] text-muted-foreground">{t('models.colMaxOutput')}</TableHead>
                     <TableHead className="text-[11px] text-muted-foreground">{t('models.colEfforts')}</TableHead>
@@ -404,6 +432,41 @@ export default function ModelsPage() {
                             <span className="font-mono text-xs font-medium">{m.id}</span>
                           )}
                         </div>
+                      </TableCell>
+                      {/* 价格列：WorkBuddy 的积分倍率。挑模型时最常看的数字，
+                          单独成列并配相对条形，比之前混在角标堆里显眼得多 */}
+                      <TableCell>
+                        {(() => {
+                          const {text, num} = fmtCredits(m.credits);
+                          if (num === null || !text) {
+                            return <span className="text-[11px] text-muted-foreground/60">—</span>;
+                          }
+                          if (num === 0) {
+                            return (
+                              <Badge variant="secondary"
+                                     className="rounded-md bg-emerald-500/10 text-[10px] font-medium text-emerald-600 dark:text-emerald-400">
+                                {t('models.creditsFree')}
+                              </Badge>
+                            );
+                          }
+                          const pct =
+                            maxCredits > 0 ? Math.max(6, Math.round((num / maxCredits) * 100)) : 0;
+                          return (
+                            <div className="flex items-center gap-2">
+                              <span className={`text-xs font-medium tabular-nums ${
+                                num > 1 ? 'text-red-500' : 'text-foreground/90'
+                              }`}>
+                                {text}
+                              </span>
+                              <span className="hidden h-1 w-14 overflow-hidden rounded-full bg-border lg:block">
+                                <span
+                                  className={`block h-full rounded-full ${num > 1 ? 'bg-red-400/70' : 'bg-emerald-400/70'}`}
+                                  style={{width: `${pct}%`}}
+                                />
+                              </span>
+                            </div>
+                          );
+                        })()}
                       </TableCell>
                       <TableCell className="text-xs tabular-nums text-muted-foreground">
                         {fmtCtx(m.context_length)}
@@ -436,18 +499,8 @@ export default function ModelsPage() {
                       </TableCell>
                       <TableCell className="pr-4">
                         <div className="flex flex-wrap items-center justify-end gap-1.5">
-                          {/* 积分倍率：同一 prompt 在不同模型上的扣费倍率，
-                              挑「省积分」的模型时最有用的一项。上游把它拼进
-                              description 前缀，我们单独展示（更清楚） */}
-                          {m.credits && (
-                            <Badge
-                              variant="secondary"
-                              className="rounded-md font-mono text-[10px]"
-                              title={t('models.creditRatioTitle')}
-                            >
-                              {m.credits}
-                            </Badge>
-                          )}
+                          {/* 积分倍率已升级为独立「价格」列（见上方价格单元格），
+                              这里不再重复显示，免得同一数字出现在一行两处 */}
                           {m.supports_images && (
                             <Badge variant="secondary" className="rounded-md text-[10px]" title={t('models.visionTitle')}>
                               {t('models.vision')}

@@ -16,6 +16,7 @@ import {useI18n} from '@/lib/i18n/provider';
 import {RichText} from '@/lib/i18n/rich-text';
 import {notify} from '@/lib/toast';
 import {translateRunLine} from '@/lib/i18n/taskrun';
+import {TaskRunResult} from '@/components/common/tasks/TaskRunResult';
 import type {TaskRunStatus} from '@/lib/types';
 
 /**
@@ -161,14 +162,18 @@ export function TaskRunnerPanel() {
         {t('tasks.runDesc')}
       </p>
 
-      {/* 输出回显：脚本按行打印进度，等长任务需要看到「跑到哪了」 */}
+      {/* 结果：结构化任务卡（按账号分组 + 汇总），原始日志折叠保留 */}
       {status && status.lines.length > 0 && (
-        <div className="max-h-[240px] overflow-auto rounded-xl bg-muted/60 p-3">
-          <pre className="whitespace-pre-wrap break-all font-mono text-[11px] leading-relaxed text-foreground/80">
-            {/* 面板回显的是上游脚本的原始 stdout（写死中文）。译文只在展示层按模板
-                逐行替换，存储与上游脚本都保持原文 —— 详见 lib/i18n/taskrun.ts。 */}
-            {status.lines.map((l) => translateRunLine(l)).join('\n')}
-          </pre>
+        <div className="space-y-2">
+          <TaskRunResult lines={status.lines} running={running} />
+          <details className="rounded-xl bg-muted/60 px-3 py-2 text-[11px] text-muted-foreground">
+            <summary className="cursor-pointer select-none">{t('tasks.showRawLog')}</summary>
+            <pre className="mt-1.5 max-h-[240px] overflow-auto whitespace-pre-wrap break-all font-mono text-[10px] leading-4">
+              {/* 面板回显的是上游脚本的原始 stdout（写死中文）。译文只在展示层按模板
+                  逐行替换，存储与上游脚本都保持原文 —— 详见 lib/i18n/taskrun.ts。 */}
+              {status.lines.map((l) => translateRunLine(l)).join('\n')}
+            </pre>
+          </details>
         </div>
       )}
 

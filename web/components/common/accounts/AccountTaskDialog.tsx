@@ -16,6 +16,7 @@ import {useI18n} from '@/lib/i18n/provider';
 import {RichText} from '@/lib/i18n/rich-text';
 import {notify} from '@/lib/toast';
 import {translateRunLine} from '@/lib/i18n/taskrun';
+import {TaskRunResult} from '@/components/common/tasks/TaskRunResult';
 import type {Account, TaskRunStatus} from '@/lib/types';
 
 /**
@@ -30,13 +31,24 @@ import type {Account, TaskRunStatus} from '@/lib/types';
  *   · 做任务 点亮 + 领奖 —— **会伪造活跃上报**（造画布、连发对话、批量用专家），
  *            所以必须二次确认，且默认不选中。
  *
- * 为什么要按账号做：全量一轮的耗时随账号数**线性增长**（脚本每个写动作间隔≥1s，
- * 全量约 40 个动作 → 6 个号约 4 分钟），而实际需求往往是「这个号想单独补一轮」。
- * 为它把全部账号再跑一遍，既慢又平白多出几十次写请求（风控面也更大）。
+ * 布局（v2，替代初版的三个小按钮 + 一坨日志）：
+ *   · 顶部账号身份卡（头像字 + 昵称 + uid）；
+ *   · 三张**模式卡**代替并排小按钮 —— 三种模式的风险差异靠卡片上的风险标签
+ *     直接可见（只读 / 幂等 / 会写上游），不再依赖悬停提示；
+ *   · 结果用结构化任务卡（TaskRunResult）代替整段日志；原始日志折叠保留。
  *
  * 后端同一时刻只允许一个任务（taskrun 是进程内单例），所以这里必须能回答
  * 「现在跑的是本账号还是别人（或全量）」——否则用户会以为自己的点击没生效。
  */
+
+const MODES = [
+  {mode: 'preview', icon: Eye, label: 'tasks.runPreview', risk: 'tasks.riskReadonly'},
+  {mode: 'claim', icon: Gift, label: 'tasks.runClaim', risk: 'tasks.riskIdempotent'},
+  {mode: 'full', icon: Play, label: 'tasks.runFull', risk: 'tasks.riskWrites'},
+] as const;
+
+type Mode = (typeof MODES)[number]['mode'];
+
 export function AccountTaskDialog({
   account,
   open,
@@ -54,6 +66,8 @@ export function AccountTaskDialog({
   const [status, setStatus] = useState<TaskRunStatus | null>(null);
   const [busy, setBusy] = useState(false);
   const [confirmFull, setConfirmFull] = useState(false);
+  /** 选中的模式：默认预览（最安全的一档作为默认值，而不是让用户从按钮堆里挑） */
+  const [mode, setMode] = useState<Mode>('preview');
   // 轮询定时器：跑的时候高频，闲着的时候低频（与 TaskRunnerPanel 同一策略）
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   /** 上一次是否在跑 —— 用来识别「刚刚跑完」这一刻，通知外部刷新一次 */
@@ -90,14 +104,14 @@ export function AccountTaskDialog({
     };
   }, [open, load, onFinished]);
 
-  async function run(mode: 'preview' | 'claim' | 'full', confirm = false) {
+  async function run(m: Mode, confirm = false) {
     if (!account) return;
     setBusy(true);
     try {
       // target 传完整 uid：上游脚本按「uid 前缀」匹配 auths 文件，完整 uid 必然
       // 唯一命中该账号（传前 8 位在极端情况下才需要担心碰撞）。
-      await accountApi.taskRunStart(mode, account.uid, confirm);
-      notify.ok(t('tasks.runStarted'), t(`tasks.runMode_${mode}`));
+      await accountApi.taskRunStart(m, account.uid, confirm);
+      notify.ok(t('tasks.runStarted'), t(`tasks.runMode_${m}`));
       await load();
     } catch (e) {
       notify.err(errText(e));
@@ -131,10 +145,11 @@ export function AccountTaskDialog({
     (status?.target || '') === 'ALL'
       ? t('accounts.taskRunAllAccounts')
       : (status?.target || '').slice(0, 8);
+  const nick = account?.nickname || t('accounts.unnamed');
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-[520px]">
+      <DialogContent className="max-w-[680px]">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <Sparkles className="size-4 text-muted-foreground" />
@@ -151,12 +166,20 @@ export function AccountTaskDialog({
           </DialogDescription>
         </DialogHeader>
 
-        {/* 账号身份：昵称会重复（同名号更常见），uid 才是唯一标识 */}
-        <div className="rounded-xl bg-muted px-3 py-2 text-[11px] text-muted-foreground">
-          <div className="truncate text-foreground">
-            {account?.nickname || t('accounts.unnamed')}
+        {/* 账号身份卡：头像字 + 昵称 + uid。昵称会重复（同名号更常见），uid 才是唯一标识 */}
+        <div className="flex items-center gap-3 rounded-xl bg-muted px-3.5 py-2.5">
+          <div className="flex size-9 shrink-0 items-center justify-center rounded-full bg-primary/10 text-sm font-medium text-primary">
+            {nick.slice(0, 1)}
           </div>
-          <div className="truncate font-mono">{uid}</div>
+          <div className="min-w-0 flex-1">
+            <div className="truncate text-[13px] font-medium text-foreground">{nick}</div>
+            <div className="truncate font-mono text-[10px] text-muted-foreground">{uid}</div>
+          </div>
+          {account?.realm === 'global' && (
+            <Badge variant="secondary" className="shrink-0 rounded-full text-[10px]">
+              {t('realm.global')}
+            </Badge>
+          )}
         </div>
 
         {confirmFull ? (
@@ -193,7 +216,7 @@ export function AccountTaskDialog({
 
             {/* 跑的是别的任务：说清「谁在跑」，否则用户会以为自己的点击没生效 */}
             {runningOther && (
-              <div className="flex items-start gap-2 rounded-xl bg-muted px-3 py-2">
+              <div className="flex items-start gap-2 rounded-xl bg-amber-500/10 px-3 py-2">
                 <TriangleAlert className="mt-0.5 size-3.5 shrink-0 text-amber-500" />
                 <span className="text-[11px] leading-relaxed text-muted-foreground">
                   {t('accounts.taskRunBusyOther', {target: otherLabel})}
@@ -212,49 +235,72 @@ export function AccountTaskDialog({
               </div>
             )}
 
-            <div className="flex flex-wrap items-center gap-2">
-              {/* 预览：只读，无风险 */}
-              <Button variant="ghost" size="sm" className="h-8 rounded-full"
-                      disabled={busy || running || !!unavailable}
-                      onClick={() => run('preview')}>
-                <Eye className="mr-1.5 size-3.5" />
-                {t('tasks.runPreview')}
-              </Button>
-              {/* 领奖：幂等，不伪造行为 */}
-              <Button variant="ghost" size="sm" className="h-8 rounded-full"
-                      disabled={busy || running || !!unavailable}
-                      title={t('tasks.runClaimHint')}
-                      onClick={() => run('claim')}>
-                <Gift className="mr-1.5 size-3.5" />
-                {t('tasks.runClaim')}
-              </Button>
-              {/* 做任务：会伪造上报，走二次确认 */}
-              <Button variant="ghost" size="sm"
-                      className="h-8 rounded-full text-amber-600 hover:text-amber-600 dark:text-amber-400"
-                      disabled={busy || running || !!unavailable}
-                      title={t('tasks.runFullHint')}
-                      onClick={() => setConfirmFull(true)}>
-                <Play className="mr-1.5 size-3.5" />
-                {t('tasks.runFull')}
-              </Button>
+            {/* 模式卡：三种模式的风险差异一眼可见，不再依赖悬停提示。
+                选中态用 ring 标出；running/unavailable 时整组禁用。 */}
+            <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+              {MODES.map(({mode: m, icon: Icon, label, risk}) => {
+                const selected = mode === m;
+                const risky = m === 'full';
+                return (
+                  <button
+                    key={m}
+                    type="button"
+                    disabled={busy || running || !!unavailable}
+                    onClick={() => setMode(m)}
+                    className={`flex items-start gap-2.5 rounded-xl border px-3 py-2.5 text-left transition-colors disabled:opacity-50 ${
+                      selected
+                        ? `border-transparent ring-1 ${risky ? 'ring-amber-500/60 bg-amber-500/5' : 'ring-primary/60 bg-primary/5'}`
+                        : 'border-border/60 hover:bg-muted/60'
+                    }`}
+                  >
+                    <Icon className={`mt-0.5 size-4 shrink-0 ${
+                      risky ? 'text-amber-600 dark:text-amber-400' : 'text-muted-foreground'
+                    }`} />
+                    <span className="min-w-0">
+                      <span className="block text-xs font-medium text-foreground">
+                        {t(label)}
+                      </span>
+                      <span className={`mt-0.5 block text-[10px] ${
+                        risky ? 'text-amber-600/90 dark:text-amber-400/90' : 'text-muted-foreground'
+                      }`}>
+                        {t(risk)}
+                      </span>
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+
+            {/* 主操作行：一个明确的 CTA 代替三个并排按钮 */}
+            <div className="flex items-center justify-end gap-2">
               {runningThis && (
                 <Button variant="ghost" size="sm"
-                        className="h-8 rounded-full text-red-500"
+                        className="rounded-full text-red-500"
                         disabled={busy} onClick={stop}>
                   <Square className="mr-1.5 size-3.5" />
                   {t('tasks.runStop')}
                 </Button>
               )}
+              <Button size="sm"
+                      className={`rounded-full ${mode === 'full' ? 'bg-amber-600 hover:bg-amber-600/90' : ''}`}
+                      disabled={busy || running || !!unavailable}
+                      onClick={() => (mode === 'full' ? setConfirmFull(true) : run(mode))}>
+                {t('tasks.runStart')} · {t(`tasks.runMode_${mode}`)}
+              </Button>
             </div>
 
-            {/* 输出回显：脚本按行打印进度，单账号也要能看到「跑到哪了」 */}
+            {/* 结果：结构化任务卡（有可解析的任务时）+ 折叠的原始日志 */}
             {status && status.lines.length > 0 && (
-              <div className="max-h-[220px] overflow-auto rounded-xl bg-muted/60 p-3">
-                <pre className="whitespace-pre-wrap break-all font-mono text-[11px] leading-relaxed text-foreground/80">
-                  {/* 回显的是上游脚本的原始 stdout（写死中文），译文只在展示层
-                      按模板逐行替换 —— 详见 lib/i18n/taskrun.ts。 */}
-                  {status.lines.map((l) => translateRunLine(l)).join('\n')}
-                </pre>
+              <div className="space-y-2">
+                <TaskRunResult lines={status.lines} running={running} />
+                <details className="rounded-xl bg-muted/60 px-3 py-2 text-[11px] text-muted-foreground">
+                  <summary className="cursor-pointer select-none">{t('tasks.showRawLog')}</summary>
+                  <pre className="mt-1.5 max-h-[220px] overflow-auto whitespace-pre-wrap break-all font-mono text-[10px] leading-4">
+                    {/* 回显的是上游脚本的原始 stdout（写死中文），译文只在展示层
+                        按模板逐行替换 —— 详见 lib/i18n/taskrun.ts。 */}
+                    {status.lines.map((l) => translateRunLine(l)).join('\n')}
+                  </pre>
+                </details>
               </div>
             )}
           </>
