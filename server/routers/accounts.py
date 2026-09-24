@@ -400,11 +400,13 @@ async def account_usage(uid: str, user: dict = Depends(security.current_user)) -
     d30 = now - 30 * 86400
 
     def _sum(where: str, args: tuple) -> dict:
+        # where 为空时不能留下尾随的 AND（SQLite 直接报语法错）
+        cond = f' AND {where}' if where else ''
         row = db.query_one(
             'SELECT COUNT(*) AS requests, COALESCE(SUM(prompt_tokens),0) AS pt, '
             'COALESCE(SUM(completion_tokens),0) AS ct, SUM(credit) AS credit, '
             'MIN(ts) AS first_ts, MAX(ts) AS last_ts '
-            f'FROM request_logs WHERE uid = ? AND status < 400 AND {where}',
+            f'FROM request_logs WHERE uid = ? AND status < 400{cond}',
             args,
         )
         # sqlite3.Row 没有 .get()，先转 dict（无行时给空 dict）
