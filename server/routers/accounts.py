@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import json
+import logging
 import shutil
 import time
 from pathlib import Path
@@ -16,7 +17,63 @@ from ..services import (
 )
 from ..services.realm import realm_of, supports_checkin
 
+logger = logging.getLogger('workbuddy.accounts')
+
 router = APIRouter(prefix='/api', tags=['accounts'])
+
+# ── 服务端侧的授权轮询（用户反馈：被遮挡窗口的定时器节流）──────────────
+#
+# 前端每 2 秒轮询一次「授权好了没」，而浏览器对**被遮挡**（不是「不可见」）的窗口
+# 会节流定时器：实测降成约 1 分钟一次，而 `document.hidden` 仍是 false、
+# visibilitychange 也不触发——代码里那个兜底因此完全失效。
+#
+# 所以把「问腾讯」这件事搬到服务端（后台任务每 2 秒一次），前端只来读结果：
+# 检测节奏与页面是否被遮挡无关，顺带避免多个窗口重复问腾讯。
+_LOGIN_POLL_SECONDS = 2.0
+_LOGIN_POLL_MAX = 300.0          # 后台最多盯 5 分钟，之后当过期处理
+_LOGIN_RESULT_TTL = 900.0        # 终态结果留 15 分钟，够前端被节流后回来取
+_login_polls: dict[str, dict] = {}       # state → 响应（终态含成功结果）
+_login_tasks: dict[str, asyncio.Task] = {}
+_login_regions: dict[str, str] = {}      # state → 国际版地区（可能晚于 auth/start 到达）
+_login_owner: dict[str, str] = {}        # state → 发起人，用于收掉同一用户的旧轮询
+
+
+def _owner_key(user: dict, upstream_id: int | None) -> str:
+    return f"{user.get('username') or ''}|{upstream_id if upstream_id is not None else ''}"
+
+
+def _cancel_other_login_polls(state: str, owner: str) -> None:
+    """同一用户又发了一张新码：把旧码的后台轮询收掉。
+
+    不发新码就换码的路径只有一条 —— 用户在弹窗里改地区（前端会重新申请）。
+    不收的话，每改一次地区就多一个轮询在替一张废码问腾讯，5 分钟内都在跑，
+    而「避免重复调用腾讯」正是把轮询搬到服务端的理由之一。
+    同一用户的多扇窗口同理：只保留最新的那张码有后台轮询；旧的窗口靠自己的
+    前端轮询照常能拿到结果（那条路径一直可用，只是不享受后台加速）。
+    """
+    for st, task in list(_login_tasks.items()):
+        if st == state or _login_owner.get(st) != owner:
+            continue
+        if task.done():
+            # 已跑完的别动：它的终态结果前端可能还没来取（结果留 TTL 那么久）
+            continue
+        task.cancel()
+        _login_tasks.pop(st, None)
+        _login_polls.pop(st, None)
+        _login_regions.pop(st, None)
+        _login_owner.pop(st, None)
+        logger.info('同一用户重新发码，旧轮询已收掉（state=%s）', st)
+
+
+def _prune_login_polls() -> None:
+    # 清掉过期结果（state 是短命的，但别让它无限增长）
+    now = time.time()
+    for st in [k for k, v in _login_polls.items()
+               if now - float(v.get('_at') or 0) > _LOGIN_RESULT_TTL]:
+        _login_polls.pop(st, None)
+        _login_tasks.pop(st, None)
+        _login_regions.pop(st, None)
+        _login_owner.pop(st, None)
 
 
 def _today_start() -> int:
@@ -204,6 +261,10 @@ async def auth_start(
         None,
         description='国内版 cn / 国际版 global；也可用 JSON body 传 {"realm": "..."}',
     ),
+    region: str | None = Query(
+        None,
+        description='国际版地区代码（如 HK）；也可用 JSON body 传 {"region": "..."}',
+    ),
     upstream_id: int | None = Query(None),
     body: dict | None = Body(None),
     user: dict = Depends(security.require_admin),
@@ -215,6 +276,11 @@ async def auth_start(
     body 里的 realm 被静默忽略、恒回落到默认值 'cn'。后果是：切到「国际版」
     点添加账号，拿到的仍是国内版二维码（`copilot.tencent.com`），且**不报错**。
     现同时接受两处，body 优先（与前端一致），query 保留兼容旧调用方。
+
+    region 也在这里收：后台轮询（见 `_poll_login_background`）要用它做地区注册，
+    而它**不能只靠前端轮询带上来** —— 窗口被遮挡时前端可能一次都不补，那条
+    路径正是这个后台轮询存在的原因。用户在弹窗里改地区会重新发码，所以这里
+    拿到的就是当前那张码对应的地区。
     """
     # 分组在这里只做**提前校验**：真正的落盘发生在 auth/poll（那里也要带
     # 同一个分组）。先拒掉不存在的分组，用户不会扫完码才发现目标分组没了。
@@ -223,8 +289,25 @@ async def auth_start(
     if isinstance(body, dict) and body.get('realm') is not None:
         raw = str(body.get('realm'))
     r = 'global' if str(raw or '').strip().lower() == 'global' else 'cn'
+    raw_region = region
+    if isinstance(body, dict) and body.get('region') is not None:
+        raw_region = str(body.get('region'))
+    reg = str(raw_region or '').strip() or None
     try:
-        return await tencent.start_login(r)
+        out = await tencent.start_login(r)
+        # 起后台轮询：前端是否被节流都不影响检测节奏（见文件上方说明）
+        st = str(out.get('state') or '')
+        if st:
+            if reg:
+                _login_regions[st] = reg
+            if st not in _login_tasks or _login_tasks[st].done():
+                _prune_login_polls()
+                _login_polls.pop(st, None)
+                _cancel_other_login_polls(st, _owner_key(user, upstream_id))
+                _login_owner[st] = _owner_key(user, upstream_id)
+                _login_tasks[st] = asyncio.create_task(
+                    _poll_login_background(st, r, reg, upstream_id, user))
+        return out
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
@@ -244,6 +327,19 @@ async def auth_poll(
     """
     if not state:
         return {'status': 'invalid'}
+
+    # 后台已经跑出终态：直接返回那一份，**不再问腾讯**。
+    # 只对终态短路：失败态（落盘失败等）要继续走下面的原路径，那里有
+    # `provisioned` 重试语义（用户点「重试」时重新落盘，而不是重扫二维码）。
+    cached = _login_polls.get(state)
+    if cached and cached.get('status') not in (None, 'waiting'):
+        # 去掉内部记账字段（`_at`）再返回，别把实现细节漏给前端
+        return {k: v for k, v in cached.items() if not k.startswith('_')}
+
+    # 地区可能比 auth/start 更晚到（用户在弹窗里选、或另一扇窗口带上来）：
+    # 记下来给后台轮询用 —— 国际版漏了地区注册，聊天会报 14017。
+    if region:
+        _login_regions[state] = region
     group = _group(upstream_id)
 
     # 落盘成功后 state 会在下面被丢弃，但如果**落盘失败**（issue #26），
@@ -316,6 +412,38 @@ def _mark_provisioned(state: str) -> None:
     cutoff = time.time() - tencent.STATE_TTL
     for k in [k for k, at in _provisioned_states.items() if at < cutoff]:
         _provisioned_states.pop(k, None)
+
+
+async def _poll_login_background(state: str, realm: str, region: str | None,
+                                  upstream_id: int | None,
+                                  user: dict) -> None:
+    """替前端把授权轮询跑完，直到出现终态（见文件上方说明）。
+
+    复用 `auth_poll` 本身：那条路径已经处理了地区注册 / trial / 签到 / 落盘与
+    各种错误分支，重写一份必然漂移。跑出终态就存住，前端来读即可。
+    """
+    deadline = time.time() + _LOGIN_POLL_MAX
+    while time.time() < deadline:
+        # 地区每轮取一次最新的：auth_start 时可能还没有（用户要先看到二维码
+        # 才会去选地区），而地区登记必须在**落盘前**完成，否则国际版新号
+        # 聊天报 14017。
+        region = _login_regions.get(state) or region
+        try:
+            resp = await auth_poll(state=state, realm=realm, region=region,
+                                   upstream_id=upstream_id, user=user)
+        except HTTPException as exc:
+            # 落盘失败这类：不存终态，让前端走原路径（那里有「重试即重新落盘」的
+            # 语义，且要保留 state 不丢）。
+            logger.warning('后台轮询遇到可重试的错误（等前端重试）: %s', exc.detail)
+            return
+        except Exception as exc:  # noqa: BLE001
+            logger.warning('后台轮询失败（不影响前端轮询）: %s', exc)
+            return
+        if resp.get('status') != 'waiting':
+            _login_polls[state] = {**resp, '_at': time.time()}
+            return
+        await asyncio.sleep(_LOGIN_POLL_SECONDS)
+    logger.info('后台轮询到时（%ss）：按过期处理', int(_LOGIN_POLL_MAX))
 
 
 def _save_and_finish(result: dict, realm_of_result: str, region_msg: str,
