@@ -441,3 +441,73 @@ class UpstreamGroupFieldsTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+# ── 评审补：评审时发现这一条没人测，而它决定「默认钥匙会不会被发去别的地址」──
+class ForwardApiKeyTest(unittest.TestCase):
+    """`upstreamsvc.forward_api_key` 的取值规则（评审补）。
+
+    这是整个分组功能里**最该被测到**的一条：分组的 api_key 留空时，它决定要不要
+    沿用默认分组那把钥匙。沿用错了方向就是「把默认上游的凭据发去另一个地址」——
+    而分组地址是管理员填的，一旦误判，凭据就跑到了那台机器上。原 PR 没有为它写
+    任何用例（新增的 1736 项里一条都没覆盖），所以这里逐档钉住。
+    """
+
+    def setUp(self) -> None:
+        from unittest import mock
+        from server import upstreamsvc
+        self.svc = upstreamsvc
+        default = {'id': None, 'is_default': True,
+                   'base_url': 'http://default.example:7863', 'api_key': 'DEFAULT-KEY'}
+        self._patch = mock.patch.object(upstreamsvc, 'default_upstream',
+                                        return_value=default)
+        self._patch.start()
+        self.addCleanup(self._patch.stop)
+
+    def test_own_key_wins(self) -> None:
+        up = {'is_default': False, 'base_url': 'http://a.example', 'api_key': 'OWN'}
+        self.assertEqual(self.svc.forward_api_key(up), 'OWN')
+
+    def test_blank_key_same_address_borrows_default(self) -> None:
+        """同址 = 同一套实例，钥匙本就是同一把 —— 不沿用的话「只填名称」的分组必吃 401。"""
+        up = {'is_default': False, 'base_url': 'http://default.example:7863/', 'api_key': ''}
+        self.assertEqual(self.svc.forward_api_key(up), 'DEFAULT-KEY')
+
+    def test_blank_key_other_address_never_borrows(self) -> None:
+        """**关键**：地址不同就必须不带鉴权头 —— 绝不把默认钥匙发去别的地址。
+
+        （这是「少沿用」的方向：别名写法会退化成不带鉴权头、换来上游 401，
+        那是可见的失败；反方向才是出事。）
+        """
+        for base in ('http://other.example:7863', 'http://default.example:7864',
+                     'https://default.example:7863', 'http://default.example:7863/v1'):
+            with self.subTest(base=base):
+                up = {'is_default': False, 'base_url': base, 'api_key': ''}
+                self.assertEqual(self.svc.forward_api_key(up), '',
+                                 f'{base} 与默认上游不同址，不该沿用默认钥匙')
+
+    def test_default_upstream_returns_its_own(self) -> None:
+        self.assertEqual(self.svc.forward_api_key({'is_default': True, 'api_key': 'DEFAULT-KEY'}),
+                         'DEFAULT-KEY')
+
+    def test_missing_upstream_is_not_a_reason_to_hand_out_the_key(self) -> None:
+        self.assertEqual(self.svc.forward_api_key(None), '')
+
+
+class MoveFilenameTraversalTest(_GroupCase):
+    """移动接口不能借文件名跳出分组目录（评审补）。
+
+    文件名来自 URL。校验若只做「目标组有没有目录」，`../` 这类名字就有机会被搬到
+    目录之外——而它对上层是 200（看起来成功了）。
+    """
+
+    def test_traversal_filename_is_rejected_and_nothing_is_moved(self) -> None:
+        victim = self.g1_dir.parent / 'victim.json'
+        victim.write_text('{}', encoding='utf-8')
+        for bad in ('../victim.json', '..%2Fvictim.json', 'a/../../victim.json'):
+            with self.subTest(filename=bad):
+                r = self.client.post(f'/api/accounts/{bad}/move',
+                                     json={'to_upstream_id': 0})
+                self.assertNotEqual(r.status_code, 200, f'{bad} 被接受了：{r.text[:120]}')
+        self.assertTrue(victim.is_file(), '目录之外的文件被动过')
+        self.assertEqual(victim.read_text(encoding='utf-8'), '{}')
+
