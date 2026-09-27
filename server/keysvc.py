@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
+import sqlite3
 import time
 
 from . import db
@@ -52,6 +53,24 @@ def _norm_realm(value: object) -> str:
     """归一化密钥的版本归属；'' = 不限制（存量密钥的形态，见 db._MIGRATIONS）。"""
     v = str(value or '').strip().lower()
     return v if v in ('cn', 'global') else ''
+
+
+def _norm_upstream_id(value: object) -> int | None:
+    """归一化密钥绑定的上游 id：空 / 非法一律当「未绑定」（= 默认上游）。
+
+    与 realm 的归一化同口径：**不报错**。原因是这个值来自管理端表单，
+    而「未绑定」本身是合法且有意义的取值（存量密钥全是这个形态），
+    把脏值吃掉成「未绑定」既安全又不会让保存整个失败。
+    真正「绑了一个不存在的上游」由路由层拦（见 routers/keys.py），
+    那里能拿到准确的 400 文案。
+    """
+    if value in (None, '', 0, '0'):
+        return None
+    try:
+        uid = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return uid if uid > 0 else None
 
 
 def _norm_credit_quota(value: object) -> float:
@@ -155,6 +174,9 @@ def _parse(row) -> dict:
         'ip_allowlist': _json_list(row['ip_allowlist']),
         'models': _json_list(row['models']),
         'realm': _norm_realm(row['realm']),
+        # 绑定的上游接入点（多上游 / 分组隔离）。None = 默认上游 —— 见 upstreamsvc
+        # 的模块注释：默认上游不是数据库里的某一行，所以这里保持 None 而不是补 0。
+        'upstream_id': _norm_upstream_id(row['upstream_id']),
         'quota': row['quota'],
         'used_tokens': row['used_tokens'],
         'quota_credit': row['quota_credit'],
@@ -165,8 +187,24 @@ def _parse(row) -> dict:
 
 
 def list_keys() -> list[dict]:
-    rows = db.query('SELECT * FROM api_keys ORDER BY id DESC')
-    return [_parse(r) for r in rows]
+    """全部密钥，附带 `packet_id`（来源红包）。
+
+    为什么要在列表里带这个：红包一次生成一批、额度零碎，混在手工建的密钥里
+    很难看，界面上要能单独分组。用**标量子查询**而不是 JOIN —— JOIN 在
+    「一个 key 意外对应多条 share」时会把同一把密钥返回两遍（接口返回重复行
+    是最难查的一类问题），子查询天然只取一条。
+    """
+    rows = db.query(
+        'SELECT k.*, (SELECT s.packet_id FROM red_packet_shares s '
+        '             WHERE s.key_id = k.id LIMIT 1) AS packet_id '
+        'FROM api_keys k ORDER BY k.id DESC'
+    )
+    out = []
+    for r in rows:
+        item = _parse(r)
+        item['packet_id'] = r['packet_id']      # None = 手工建的
+        out.append(item)
+    return out
 
 
 def create_key(
@@ -178,26 +216,44 @@ def create_key(
     quota: int = 0,
     realm: str = '',
     quota_credit: float = 0,
+    upstream_id: int | None = None,
+    *,
+    _conn: sqlite3.Connection | None = None,
 ) -> dict:
+    """创建一个密钥。返回含**明文 token** 的字典（库里只存哈希）。
+
+    `_conn`：传入一个**已开启事务**的连接时，本函数在它上面执行且**不自行提交**，
+    由调用方负责 commit/rollback。红包（`redpacket.create_packet`）用它来保证
+    「N 个密钥 + 红包记录」整批原子——中途失败必须整体回滚，否则会留下几个
+    没人知道出处的密钥。默认 None 时行为与从前完全一致（自己提交）。
+
+    之所以做成参数而不是让红包自己写一份 INSERT：SQL 抄第二遍就是第二份事实，
+    改一处漏一处——本项目在 count_tokens 的鉴权上正是这么漂移出真漏洞的。
+    """
     token = TOKEN_PREFIX + secrets.token_urlsafe(32)
-    key_id = db.execute(
-        'INSERT INTO api_keys(name, key_hash, prefix, enabled, expires_at, max_ips, ip_allowlist, models, realm, quota, used_tokens, quota_credit, used_credit, created_at) '
-        'VALUES(?, ?, ?, 1, ?, ?, ?, ?, ?, ?, 0, ?, 0, ?)',
-        (
-            name,
-            _hash(token),
-            token[:12],
-            expires_at,
-            max_ips,
-            json.dumps(_norm_cidrs(ip_allowlist)),
-            json.dumps(models or []),
-            _norm_realm(realm),
-            quota,
-            _norm_credit_quota(quota_credit),
-            int(time.time()),
-        ),
+    sql = ('INSERT INTO api_keys(name, key_hash, prefix, enabled, expires_at, max_ips, '
+           'ip_allowlist, models, realm, quota, used_tokens, quota_credit, used_credit, '
+           'created_at, upstream_id) VALUES(?, ?, ?, 1, ?, ?, ?, ?, ?, ?, 0, ?, 0, ?, ?)')
+    args = (
+        name,
+        _hash(token),
+        token[:12],
+        expires_at,
+        max_ips,
+        json.dumps(_norm_cidrs(ip_allowlist)),
+        json.dumps(models or []),
+        _norm_realm(realm),
+        quota,
+        _norm_credit_quota(quota_credit),
+        int(time.time()),
+        _norm_upstream_id(upstream_id),
     )
-    row = db.query_one('SELECT * FROM api_keys WHERE id = ?', (key_id,))
+    if _conn is not None:
+        key_id = int(_conn.execute(sql, args).lastrowid or 0)
+        row = _conn.execute('SELECT * FROM api_keys WHERE id = ?', (key_id,)).fetchone()
+    else:
+        key_id = db.execute(sql, args)
+        row = db.query_one('SELECT * FROM api_keys WHERE id = ?', (key_id,))
     out = _parse(row)
     out['key'] = token  # 仅此一次返回明文
     return out
@@ -229,6 +285,10 @@ def update_key(key_id: int, patch: dict) -> dict | None:
         fields['quota'] = int(patch['quota'] or 0)
     if 'quota_credit' in patch:
         fields['quota_credit'] = _norm_credit_quota(patch['quota_credit'])
+    if 'upstream_id' in patch:
+        # 显式传 null / 0 是**允许**的：管理员可以把密钥改回「默认上游」。
+        # 与 realm 同口径，不能用真值判断（否则改不回默认上游）。
+        fields['upstream_id'] = _norm_upstream_id(patch['upstream_id'])
     if fields:
         assignments = ', '.join(f'{k} = ?' for k in fields)
         db.execute(f'UPDATE api_keys SET {assignments} WHERE id = ?', (*fields.values(), key_id))

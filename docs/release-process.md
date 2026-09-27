@@ -1,39 +1,43 @@
 # 发布流程（维护者手册）
 
-上游 `workbuddy2api` 改动频繁，且**多数改动不会让管理端报错**——只会让某处
-行为悄悄失配（参数位置、请求头形态、默认值翻转、错误码语义）。所以发版前
-必须先看上游，而不是直接发。
+上游 `workbuddy2api` 的**公开地址自 2026-09-23 起不可用**。维护者手上保留着完整的
+源码副本，继续维护；**不要把上游代码提交进本仓库，也不要另开公开镜像** ——
+用户侧的源码来自我们的 Release 包（见下）。
 
-## 发版前：先查上游
+## 上游停更之后
 
-```bash
-cd /tmp && rm -rf upcheck
-git clone --quiet --filter=blob:none --no-checkout \
-  https://github.com/Sliverkiss/workbuddy2api.git upcheck
-cd upcheck
-git log --oneline -5                       # 当前最新是什么
-git log --oneline <上次适配到的提交>..HEAD   # 有没有新提交
-```
+- **发版前不再需要查上游**：没有新提交可对。`deploy/check-upstream.sh` 仍可运行，
+  它会明确告诉你「上游仓库已不可访问，这一步不再需要」并以 0 退出
+  （把 `UPSTREAM_REPO` 指向你自己的副本时，它照旧按老规矩检查）。
+- **源码从哪来**：维护者手上留存了一份**最后版本的源码归档**（HEAD 快照，
+  287 个文件，含 `LICENSE`）。它是完整的、可构建的；但原克隆是 blob-less
+  部分克隆，**逐版本历史无法完整还原**，所以归档以「单次导入提交」的形式保存，
+  不能 checkout 出中间某次提交的源码。
+- **源码怎么到达用户**（**不要**把上游代码提交进本仓库，也不要另开公开镜像）：
+  上游源码走 Release 包：
+  1. 把最新的源码放进归档目录（覆盖对应文件；手上没有新源码就跳过这步）；
+  2. `python dev/pack_upstream_src.py <源码目录> -o /tmp/upstream-pack --stamp "本次改了什么"`
+     —— 打成 `workbuddy2api-src.tar.gz`（自动排除 `.git` 与 `config.json`/`auths`/`data`）；
+  3. `gh release upload upstream-src /tmp/upstream-pack/workbuddy2api-src.tar.gz --clobber`
+     —— 覆盖到**固定的载体 Release**（tag `upstream-src`，**必须是 pre-release**：
+     否则它会成为 `releases/latest`，把面板的更新检查带偏）；
+  4. 之后任何一次面板发版，CI 都会把它塞进发布包的 `upstream/`（取不到只告警、不
+     阻断发布），用户装/更新时就用它。
+- **改动上游代码**：改本地那份源码（`/opt/workbuddy2api`），
+  然后 `docker compose up -d --build`。改的是别人的 MIT 代码，需保留其
+  `LICENSE` 与版权声明。
+- **`adapt(upstream)` 提交**：有可访问的上游代码要跟时照旧写——把核对过的上游
+  提交号写进提交信息，供下次对照。
 
-- **没有新提交** → 直接发版
-- **有新提交** → 逐个读，判断是否影响管理端；需要适配就先适配、补测试，
-  再发版（适配与发版可以是两个提交，但不要带着未处理的适配发版）
+### 仍然要守的老规矩
 
-> 上次适配到的提交：写在最新一条 `adapt(upstream): ...` 提交信息里，例如
-> `adapt(upstream): 出站指纹默认对齐桌面端；新增快过期积分窗口` 对应上游
-> `bc77429`。查一下最近的 adapt 提交即可。
+管理端与上游之间有两条耦合路径 —— 即使上游停更，**改上游代码时**这两条依然成立：
 
-### 判断「是否需要适配」的准绳
+1. **转发路径**（网关 `/v1/*` → 上游）：改到**入站协议/响应形状**就必须同步改面板。
+2. **直连路径**（管理端**绕过上游直连腾讯**）：扫码登录、签到、查积分、地区注册、
+   trial、探测。这条路与上游各写一份参照实现，**改一边不会自动改另一边**。
 
-管理端有两条路径会与上游产生耦合：
-
-1. **转发路径**（网关 `/v1/*` → 上游）：上游改内部实现通常与我们无关，
-   但如果它改了**入站协议/响应形状**，我们就得跟。
-2. **直连路径**（管理端**绕过上游直连腾讯**）：扫码登录、签到、查积分、
-   地区注册、trial、探测。**上游的改动不会自动惠及这条路**，需要人工同步
-   （请求头、请求体形状、错误码语义都要对齐上游的参照实现）。
-
-第 2 类最容易漏，因为上游改了不会通知我们，接口也照样返回 200。
+第 2 类最容易漏：两边接口都返回 200，行为却已经不一致。
 
 ## 更新日志的写法：写给用户，不是写给同事
 
@@ -179,7 +183,6 @@ gh release upload vX.Y.Z workbuddy-manager-vX.Y.Z.tar.gz.sig \
 **协作者可以独立完成的部分**
 
 ```bash
-bash deploy/check-upstream.sh <上次适配到的提交>   # 先查上游
 # 改 .version 与 server/main.py 的 version、CHANGELOG.md 加段落
 python -m unittest discover -s server/tests -t .   # 全绿
 # 走 PR 合入 main，再推 tag

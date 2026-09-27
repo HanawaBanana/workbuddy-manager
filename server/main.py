@@ -11,13 +11,14 @@ from fastapi.staticfiles import StaticFiles
 
 import logging
 
-from . import config, db, security
+from . import config, db, redpacket, security
 from .iputil import client_ip
 from .routers import (
     accounts, anthropic, auth, gateway, keys, logs, models, playground,
-    responses, security as security_router, settings, stats, system,
+    redpackets, responses, security as security_router, settings, stats,
+    system, tokens, upstreams,
 )
-from .services import renew, tasklog, taskrun
+from .services import accountlog, renew, tasklog, taskrun
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,11 @@ async def lifespan(app: FastAPI):
     db.connect()
     security.load_users()  # 首次启动会自动生成管理员并打印一次密码
     _warn_if_exposed()
+    # 给「抽奖码」这一列上线之前建的红包补码（幂等）：没有码就拼不出抽奖链接，
+    # 等于那些红包只能自己发 key、没法让大家抽。
+    filled = redpacket.backfill_codes()
+    if filled:
+        logger.info('为 %d 个旧红包补上了抽奖码', filled)
     # 后台采集上游自动任务日志（旅行/活跃/签到/保活），容器日志会被重建清掉，
     # 这里解析后落库长期保留，界面才能看到「这趟旅行领了多少积分」
     tasklog.start_collector()
@@ -37,12 +43,16 @@ async def lifespan(app: FastAPI):
     # token 自动续期（issue #40）：上游只在「保活时刻」与「有流量时」刷新，
     # 长期闲置的账号会一路走到过期。这里按剩余寿命巡检补齐那个空档。
     renew.start_scheduler()
+    # 请求日志的「账号」回填（issue #69）：账号是上游选的、不在响应里回传，
+    # 只能从它的容器日志里读出来再按时间对回去（见 accountlog 的说明）。
+    accountlog.start_collector()
     try:
         yield
     finally:
         tasklog.stop_collector()
         taskrun.stop_scheduler()
         renew.stop_scheduler()
+        accountlog.stop_collector()
 
 
 def _warn_if_exposed() -> None:
@@ -64,7 +74,7 @@ def _warn_if_exposed() -> None:
 
 app = FastAPI(
     title='WorkBuddy Manager',
-    version='1.0.66',
+    version='1.0.73',
     lifespan=lifespan,
     # 生产环境默认关闭交互式文档与 OpenAPI 描述：
     # 它们会把管理接口全貌（路径、参数、结构）暴露给任何未认证访问者，
@@ -125,10 +135,18 @@ async def limit_api_body(request: Request, call_next):
 app.include_router(auth.router)
 app.include_router(accounts.router)
 app.include_router(keys.router)
+# 红包：批量发放带额度的密钥（与密钥同属「分发」这件事，所以挨着放）
+app.include_router(redpackets.router)
+# 抽奖：**公开端点**（收到链接的人不需要账号），单独挂便于区分边界
+app.include_router(redpackets.claim_router)
 app.include_router(logs.router)
 app.include_router(stats.router)
 app.include_router(security_router.router)
+# 管理面作用域化 API Token（见 docs/api-tokens.md）；接口本身只接受会话鉴权
+app.include_router(tokens.router)
 app.include_router(settings.router)
+# 多上游（账号池分组）：密钥绑定上游 = 请求走那个池，见 upstreamsvc
+app.include_router(upstreams.router)
 app.include_router(system.router)
 app.include_router(models.router)
 app.include_router(playground.router)

@@ -246,7 +246,8 @@ def _atomic_write_json(target: Path, payload: dict) -> None:
         raise
 
 
-def update_auth_tokens(filename: str, fields: dict) -> None:
+def update_auth_tokens(filename: str, fields: dict,
+                       auth_dir: Path | None = None) -> None:
     """就地更新账号文件里的 token 字段，**其余原样保留**（issue #40）。
 
     与 `write_auth_file` 的分工：那个是「新建/重登」，按登录响应重建整份文件；
@@ -261,7 +262,7 @@ def update_auth_tokens(filename: str, fields: dict) -> None:
     文件不存在时抛 FileNotFoundError；解析失败时抛 ValueError（宁可不写，
     也不要把一份坏内容覆盖到用户仅存的凭证上）。
     """
-    target = _safe_auth_path(filename)
+    target = _safe_auth_path(filename, auth_dir)
     try:
         raw = json.loads(target.read_text(encoding='utf-8'))
     except FileNotFoundError:
@@ -291,18 +292,22 @@ def update_auth_tokens(filename: str, fields: dict) -> None:
     _atomic_write_json(target, raw)
 
 
-def _safe_auth_path(filename: str) -> Path:
-    """把文件名解析为 auths 目录下的真实路径（与 wb2api._safe_file 同口径）。"""
+def _safe_auth_path(filename: str, auth_dir: Path | None = None) -> Path:
+    """把文件名解析为 auths 目录下的真实路径（与 wb2api._safe_file 同口径）。
+
+    auth_dir 非空时按该**分组**的账号目录解析（多分组 / 账号池）；缺省仍读
+    config.AUTH_DIR。
+    """
     if ('/' in filename or '\\' in filename or '..' in filename
             or '\x00' in filename):
         raise ValueError('非法的文件名')
     base = filename[:-len('.disabled')] if filename.endswith('.disabled') else filename
     if not re.fullmatch(r'workbuddy[A-Za-z0-9_.-]*\.json', base):
         raise ValueError('非法的文件名')
-    return config.AUTH_DIR / filename
+    return (auth_dir or config.AUTH_DIR) / filename
 
 
-def write_auth_file(account: dict) -> tuple[str, bool]:
+def write_auth_file(account: dict, auth_dir: Path | None = None) -> tuple[str, bool]:
     """严格按 workbuddy2api 的嵌套结构落盘，返回 (文件名, 是否覆盖)。
 
     realm 写在 `auth` 对象内（与 domain 同级）——上游就是从这里读的。
@@ -323,8 +328,9 @@ def write_auth_file(account: dict) -> tuple[str, bool]:
     # 白名单，这里把**写**路径补齐，两边口径一致。
     if not re.fullmatch(r'[0-9A-Za-z_-]{1,80}', uid):
         raise ValueError(f'账号 uid 形态异常，已拒绝写入（{uid[:40]!r}）')
-    config.AUTH_DIR.mkdir(parents=True, exist_ok=True)
-    target = config.AUTH_DIR / f'workbuddy-{uid}.json'
+    base = auth_dir or config.AUTH_DIR
+    base.mkdir(parents=True, exist_ok=True)
+    target = base / f'workbuddy-{uid}.json'
     existed = target.exists()
     domain = account.get('domain', '')
     resolved = resolve_realm(account.get('realm'), domain)
@@ -647,10 +653,32 @@ async def fetch_models(auth: dict) -> tuple[bool, list | str]:
                 continue
             merged[mid] = items[mid]
             order.append(mid)
+    for mid, item in merged.items():
+        item.update(_image_capability(ent_items.get(mid), v3_items.get(mid)))
     out = [merged[i] for i in order]
     if not out:
         return False, '模型接口未返回任何可用模型'
     return True, out
+
+
+def _image_capability(enterprise: dict | None, config_v3: dict | None) -> dict:
+    """Platform image-input declarations, not native model multimodality.
+
+    Contradictory official declarations are unknown, never silently overridden.
+    Missing/malformed values remain unknown rather than becoming False or True.
+    """
+    sources = {}
+    for label, item in (('enterprise_models', enterprise), ('v3_config', config_v3)):
+        if item is not None:
+            value = item.get('supports_images')
+            sources[label] = value if type(value) is bool else None
+    known = {v for v in sources.values() if type(v) is bool}
+    conflict = len(known) > 1
+    return {
+        'supports_images': next(iter(known)) if len(known) == 1 else None,
+        'image_input_conflict': conflict,
+        'image_input_sources': sources,
+    }
 
 
 def _parse_model_payload(data: object, realm: Realm) -> tuple[dict[str, dict], list[str]]:
@@ -705,8 +733,8 @@ def _parse_model_payload(data: object, realm: Realm) -> tuple[dict[str, dict], l
             # 推理默认档位（上游 2026-09-14 起解析并用于 thinking 决策）。
             # 空 = 上游未声明，此时上游会回退到自己的硬编码默认。
             'default_effort': str(reasoning.get('defaultEffort') or '').strip(),
-            # 多模态能力：官方 /v1/models 也透出该字段（supports_images）
-            'supports_images': bool(m.get('supportsImages')),
+            # 官方平台图片输入声明；不代表模型原生多模态能力。
+            'supports_images': m.get('supportsImages') if type(m.get('supportsImages')) is bool else None,
             # ── 以下为上游 2026-09-15 补齐的模型目录字段（我们直连腾讯，本就能取到）──
             # 说明：字段名照上游 dynModelEntry 的 JSON 标签（descriptionZh / credits /
             # tags / vendor …），那是它从同一接口解析出来的实测结果，不是猜的。

@@ -157,6 +157,15 @@ export interface AccountsResponse {
   pool_synced?: number;
   /** 上游是否可达 */
   pool_available?: boolean;
+  /**
+   * 分组上下文（多账号池）：这次列表来自哪个分组。默认分组也带这个字段
+   * （is_default = true）——界面靠它标注「本列表属于哪一组」。
+   */
+  upstream?: {id: number | null; name: string; is_default: boolean};
+  /** 该分组的本地账号目录；空串 = 未配置（该分组在面板里只能看、不能管理账号） */
+  auth_dir?: string;
+  /** 该分组能否在面板管理账号（= 配置了本地账号目录） */
+  manageable?: boolean;
 }
 
 /** 上游为一组账号给出的计数（`/status` 的顶层汇总与 realm_totals 同构） */
@@ -244,8 +253,13 @@ export interface CatalogModel {
   reasoning_summary?: string;
   /** 默认推理档位；空串 = 上游未声明（由上游自行回退到硬编码默认） */
   default_effort: string;
-  /** 是否支持图片输入（多模态） */
-  supports_images: boolean;
+  /** 平台声明的图片输入能力；null 表示未知或冲突，不代表模型原生多模态 */
+  supports_images: boolean | null;
+  native_modality?: 'text' | 'multimodal' | 'router' | 'unknown';
+  native_modality_source?: string;
+  native_modality_verified_at?: string;
+  image_input_conflict?: boolean;
+  image_input_sources?: Record<string, boolean | null>;
   /** 系列归属（按 id 前缀推导，仅用于分组浏览） */
   series: string;
 }
@@ -287,6 +301,41 @@ export interface ModelCatalog {
   summary: CatalogSummary;
 }
 
+/**
+ * 上游接入点（多上游 / 账号池分组）。
+ *
+ * `id === null && is_default` 那条是**默认上游**：来自环境变量 / 上游 config.json，
+ * 不是数据库记录，所以它没有 id、也不可改不可删。
+ */
+export interface UpstreamEndpoint {
+  id: number | null;
+  name: string;
+  base_url: string;
+  /**
+   * 上游凭据**不明文回传**（与 api_key / upstash.token 同规矩）：接口只给
+   * 「有没有配」与脱敏值。编辑时留空即不修改。
+   */
+  has_key: boolean;
+  api_key_masked: string;
+  note: string;
+  enabled: boolean;
+  is_default: boolean;
+  /**
+   * 该分组的**本地账号目录**（绝对路径）：面板按它列账号 / 添号 / 移动账号。
+   * 空串 = 该分组只用于密钥转发，不管账号。默认分组 = 部署时的 WB_AUTH_DIR。
+   */
+  auth_dir: string;
+  /**
+   * 该分组上游实例的容器名（可选）：面板「重启该分组」按它 docker restart。
+   * 空串 = 不能从面板重启（账号文件的增删改由上游热加载自动收录）。
+   */
+  container: string;
+  /** 有多少把密钥绑定在它上面（默认上游那行 = 未绑定上游的密钥数） */
+  bound_keys: number;
+  created_at?: number | null;
+  updated_at?: number | null;
+}
+
 export interface ApiKey {
   id: number;
   name: string;
@@ -314,10 +363,161 @@ export interface ApiKey {
    */
   quota_credit: number;
   used_credit: number;
+  /**
+   * 绑定的上游接入点（多上游 / 分组隔离）；null = 默认上游。
+   *
+   * 为什么是可空 id 而不是「上游名字」：默认上游不是数据库里的一行
+   * （见 server/upstreamsvc.py），空值本身就代表「走默认」这个合法状态。
+   */
+  upstream_id?: number | null;
+  /**
+   * 来源红包的 id；null = 手工建的。
+   *
+   * 密钥列表按它分成两个 tab：红包一次生成一批、额度零碎，与手工建的混在
+   * 一起很难看（也从没人会去逐把编辑红包发出去的密钥）。
+   */
+  packet_id: number | null;
   created_at: number;
   last_used_at: number | null;
   /** 仅在创建时返回一次 */
   key?: string;
+}
+
+/**
+ * 密钥导出结果（`POST /api/keys/export`）。
+ *
+ * 两个客户端的载荷载体不同，故用可选字段而不是联合类型：调用方按 `client`
+ * 取值即可，避免为两个分支各写一份收窄逻辑。
+ *   · ccswitch → `app_type` + `settings_config`
+ *   · zcode    → `provider`（片段，含 providerRule 与 providerModelRules）
+ */
+export interface KeyExportResult {
+  client: 'ccswitch' | 'zcode';
+  /** 面板对外地址 + /v1，客户端实际要填的 base URL */
+  base_url: string;
+  realm: 'cn' | 'global';
+  /** **网关口径**的模型 id（带 cn: / global: 前缀） */
+  models: string[];
+  name: string;
+  app_type?: 'claude' | 'codex';
+  settings_config?: Record<string, unknown>;
+  provider?: Record<string, unknown>;
+}
+
+/**
+ * 本机一键导入：单个客户端的可写状态（见 server/services/keyimport.py）。
+ *
+ * `running` 是**三态**：true / false / null，null = 探测不到。后端把 null 也
+ * 当作"不能写"（fail-closed）：漏判的代价是写坏用户本机配置，误判的代价只是
+ * 让用户改用导出，两者不对称。
+ */
+export interface KeyImportClientStatus {
+  client: 'ccswitch' | 'zcode';
+  /** 该客户端的配置文件是否存在 */
+  installed: boolean;
+  /** 是否正在运行；null = 探测不到 */
+  running: boolean | null;
+  /** 综合结论：现在能不能*直接写*（客户端没在跑时才为 true） */
+  importable: boolean;
+  /** 不能直写的原因；可写时为空串 */
+  reason: '' | 'not_installed' | 'client_running' | 'cannot_detect';
+  /** 会被写入的文件路径 */
+  target: string;
+  /**
+   * 面板认得的可执行文件；null = 还没定位到（界面提示可点「自动检测」）。
+   * 直写模式下要在写完后把客户端拉起来，靠的就是它。
+   */
+  exe: string | null;
+  /** 上面那个路径是从哪认出来的：env / process / protocol / cache / registry / known-dir / scan */
+  exe_source: string;
+  /** 正在运行、但可以自动关闭（定位到了 exe）——界面要提前说清"会先替你关掉它" */
+  needs_close: boolean;
+  /** 本机支持客户端官方的 ccswitch:// 深链导入（首选路径：不用关客户端、不用改它的库） */
+  deeplink: boolean;
+}
+
+export interface KeyImportStatus {
+  /** 面板侧开关（WB_LOCAL_IMPORT），默认关 */
+  enabled: boolean;
+  /** 这次请求是否来自面板所在机器；false 时只能导出后手动导入 */
+  local_caller: boolean;
+  clients: KeyImportClientStatus[];
+}
+
+/**
+ * 导入结果。**不含密钥**——服务端刻意不回显：配置已经落盘，没必要再把明文
+ * 放进响应体（明文只该在「创建密钥」那一次出现）。
+ */
+export interface KeyImportResult {
+  client: 'ccswitch' | 'zcode';
+  app: '' | 'claude' | 'codex';
+  realm: 'cn' | 'global';
+  base_url: string;
+  model_count: number;
+  /**
+   * 走的是哪条路：
+   *  · `deeplink` = 把配置拼成客户端官方的 ccswitch:// 链接交给系统，
+   *    由客户端自己弹确认框、自己入库（此时 `action` 是 `handed-off`）；
+   *  · `direct`   = 面板直接改它的配置/数据库。
+   */
+  method: 'deeplink' | 'direct';
+  /** created = 新增；updated = 更新了已有项；handed-off = 已交给客户端去导入 */
+  action: 'created' | 'updated' | 'handed-off';
+  provider_id: string;
+  /** 实际写入的文件（深链模式下为空：面板没碰文件） */
+  target: string;
+  /** 写入前的备份（可据此回滚）；深链模式下为空 */
+  backup: string;
+  /** 直写模式才有的进程生命周期：是否被面板关掉/重新拉起 */
+  lifecycle: {
+    stopped: boolean;
+    forced: boolean;
+    /** null = 没关过（谈不上重开）；false = 关了但没拉起来 */
+    restarted: boolean | null;
+    exe: string;
+  } | null;
+  name?: string;
+  app_type?: 'claude' | 'codex';
+  /** 深链模式：真正接收这条链接的客户端可执行文件 */
+  handler?: string;
+}
+
+/** 自动检测客户端位置的结果（面板的「自动检测」按钮）。 */
+export interface KeyImportDetectResult {
+  client: 'ccswitch' | 'zcode';
+  found: boolean;
+  exe: string | null;
+  /** 从哪找到的；没找到时为空串。界面据此说明"是从注册表/扫描里认出来的" */
+  source: '' | 'env' | 'process' | 'protocol' | 'cache' | 'registry'
+    | 'known-dir' | 'scan';
+}
+
+/**
+ * 管理面**作用域化 API Token**（见 docs/api-tokens.md）。
+ *
+ * 与上面那把网关密钥（`ApiKey`）是**两套东西**：`ApiKey` 只授权模型调用；
+ * 本类型授权的是管理接口 `/api/*`，供脚本 / CI 免登录调用。
+ */
+export interface ApiToken {
+  id: number;
+  name: string;
+  /** 明文前 12 字符，用于展示与识别（明文本身不会再回传） */
+  prefix: string;
+  /** 权限：只读 / 管理员（角色由它决定） */
+  scope: 'readonly' | 'admin';
+  enabled: boolean;
+  /** 到期时刻（epoch 秒）；null = 永不过期 */
+  expires_at: number | null;
+  created_at: number;
+  /** 创建者用户名（审计用） */
+  created_by: string;
+  last_used_at: number | null;
+  last_used_ip: string | null;
+}
+
+/** 创建令牌的返回：比 ApiToken 多一个**仅此一次**的明文字段。 */
+export interface CreatedApiToken extends ApiToken {
+  token: string;
 }
 
 export interface RequestLog {
@@ -338,20 +538,31 @@ export interface RequestLog {
    * 与 latency_ms 的区别：latency_ms 含模型生成全部内容的耗时，回答越长越大，
    * 反映不出上游响应快慢；首字延迟才是「上游多久开始回话」。
    */
+  first_token_ms: number | null;
   /**
    * 提示词缓存的三段 token（issue #69）：上游（腾讯）在流式末帧 usage 里给。
    * **null = 上游没给这三个字段**（老上游），与「给了 0」不是一回事——
    * 后者代表这次请求确实没命中缓存。界面据此显示「—」而不是 0%。
+   *
+   * 前缀缓存是**按账号**存的，所以「换了号」与「没命中」常常一起出现，
+   * 与下面那个 account 列对着看才有意义。
    */
   cache_hit_tokens: number | null;
   cache_miss_tokens: number | null;
   cache_write_tokens: number | null;
-  first_token_ms: number | null;
   ua: string | null;
   error: string | null;
   stream: boolean;
   /** 本次调用的真实扣费（上游 usage.credit）；null = 上游未返回，不是 0 */
   credit: number | null;
+  /**
+   * 本次实际用了哪个上游账号，形如 `昵称(uid8)`。
+   *
+   * 账号由上游决定、不在响应里回传，本端是**采集上游容器日志后按时间对回来的**，
+   * 所以比请求本身晚几秒——刚打完的请求这一列可能还是 null（界面显示「—」，
+   * 稍后刷新即有）。null 也可能是「日志已滚掉」或「上游没在跑容器」。
+   */
+  account: string | null;
 }
 
 export interface UsagePoint {
@@ -847,4 +1058,111 @@ export interface UpstreamStats {
   uptime_sec?: number;
   total?: UpstreamStatRow;
   models?: UpstreamStatRow[];
+}
+
+/* ── 红包：一次建一批带额度的密钥，管理员自己分发 ──────────
+ * 见 server/redpacket.py 的模块说明（为什么不做领取页/分享码）。 */
+
+/**
+ * 额度类别。两者**限制的对象不同**，不只是单位不同：
+ * credit 限制上游返回的真实扣费（口径准）；token 限制 token 总数（直观）。
+ */
+export type RedPacketKind = 'credit' | 'token';
+
+/** 分配方式：lucky = 拼手气（有人多有人少），even = 均分 */
+export type RedPacketMode = 'lucky' | 'even';
+
+export interface RedPacket {
+  id: number;
+  title: string;
+  quota_kind: RedPacketKind;
+  total_amount: number;
+  shares: number;
+  mode: RedPacketMode;
+  /**
+   * 限定的模型范围。**token 红包非空、积分红包恒为空**（两类规则相反，见
+   * server/redpacket.py 的 validate）：token 是「量」与模型强相关，
+   * 积分是「钱」任何模型都能用。
+   */
+  models: string[];
+  /**
+   * 抽奖码 —— 拼出分享链接用。**它是凭据**：拿到就能抽走一份，
+   * 所以只在管理端接口下发，不要贴到公开场合。
+   */
+  code: string;
+  created_by: string;
+  created_at: number;
+  expires_at: number;
+  /** 已被抽走的份数（抽奖式红包看的就是这个进度） */
+  claimed: number;
+  /** 整批都已停用 = 已收回（部分停用不算，那种情况去密钥页看单把） */
+  revoked: boolean;
+}
+
+/** 红包里的一份（= 一个密钥）。**不含明文** —— 库里只有哈希。 */
+export interface RedPacketItem {
+  key_id: number;
+  prefix: string;
+  amount: number;
+  enabled: boolean;
+  used_tokens: number;
+  used_credit: number;
+}
+
+export interface RedPacketDetail extends RedPacket {
+  items: RedPacketItem[];
+}
+
+/**
+ * 创建红包的结果：含**明文 key**，且**仅此一次**（与 keyApi.create 同理）。
+ *
+ * 界面上必须提示「离开后无法再看到」并提供复制/导出 —— 这是「直接发 key」
+ * 方案的固有代价，不是缺陷。
+ */
+/** 抽奖页的元信息。**不含密钥** —— 没点「开启」之前不该能拿到。 */
+export interface ClaimInfo {
+  title: string;
+  quota_kind: RedPacketKind;
+  shares: number;
+  /** 还剩几份 */
+  left: number;
+  models: string[];
+  expires_at: number;
+  expired: boolean;
+  /** 本机（IP）是不是已经抽过了 */
+  claimed: boolean;
+  /**
+   * 本机领到的那一份（没领过时为 null）。
+   *
+   * 第二次打开时会**直接展示**：关掉弹窗才想起没存密钥是很常见的，而明文
+   * 只显示那一次 —— 刷新就能找回来，比「请联系发红包的人」有用。
+   * 代价是同一 NAT 出口下的人能看到彼此的那份（红包的熟人场景下可接受）。
+   */
+  my_amount: number | null;
+  my_key: string | null;
+}
+
+/** 抽到的那一份。`key` 是**明文**，只在抽的这一刻返回。 */
+export interface DrawResult {
+  amount: number;
+  quota_kind: RedPacketKind;
+  models: string[];
+  key: string;
+  expires_at: number;
+}
+
+export interface CreatedRedPacket {
+  id: number;
+  title: string;
+  quota_kind: RedPacketKind;
+  total_amount: number;
+  shares: number;
+  mode: RedPacketMode;
+  /** 同上：token 红包非空、积分红包恒为空 */
+  models: string[];
+  /** 抽奖码 —— 拼分享链接用（仅此一次能拿到，之后详情接口还会给） */
+  code: string;
+  created_at: number;
+  expires_at: number;
+  keys: ApiKey[];
 }

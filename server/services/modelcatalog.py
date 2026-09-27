@@ -15,11 +15,12 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 
 from .. import config
-from . import tencent, wb2api
+from . import tencent, wb2api, native_modality
 
 # 成功缓存 5 分钟：模型清单变化很慢，没必要每次进页面都打腾讯
 _TTL_OK = 300
@@ -167,6 +168,7 @@ def _decorate(items: list[dict], realm: str = 'cn') -> list[dict]:
             eff_default = ''
         out.append({
             'id': mid,
+            **native_modality.describe(mid),
             'name': m.get('name') or '',
             'context_length': int(m.get('context_length') or 0),
             'max_output_tokens': int(m.get('max_output_tokens') or 0),
@@ -174,8 +176,10 @@ def _decorate(items: list[dict], realm: str = 'cn') -> list[dict]:
             'series': series_of(mid),
             # 默认推理档位；空 = 未声明（由上游自行回退到硬编码默认）
             'default_effort': eff_default,
-            # 多模态能力（官方 /v1/models 也透出 supports_images）
-            'supports_images': bool(m.get('supports_images')),
+            # 平台图片输入声明保留 true/false/unknown 与官方来源冲突。
+            'supports_images': m.get('supports_images') if type(m.get('supports_images')) is bool else None,
+            'image_input_conflict': m.get('image_input_conflict') is True,
+            'image_input_sources': dict(m.get('image_input_sources') or {}),
             # ── 上游 2026-09-15 补齐的目录字段 ──
             # 模型描述（腾讯的 descriptionZh，中文）
             'description': str(m.get('description') or ''),
@@ -314,7 +318,8 @@ def _map_upstream_model_fields(m: dict) -> dict:
             else:
                 out[dst] = str(m.get(src) or '')
     if 'supports_images' in m:
-        out['supports_images'] = bool(m.get('supports_images'))
+        out['supports_images'] = m.get('supports_images') if type(m.get('supports_images')) is bool else None
+        out['image_input_sources'] = {'upstream_models': out['supports_images']}
     return out
 
 
@@ -371,6 +376,35 @@ def cached_ids(realm: str) -> set[str] | None:
     if not models:
         return None
     return {str(m.get('id') or '') for m in models if isinstance(m, dict) and m.get('id')}
+
+
+def fetch_ids_blocking(realm: str) -> dict:
+    """**同步**拉一次该版本的模型目录，返回 `catalog()` 的结果（给同步路由用）。
+
+    为什么要这个同步桥：本应用的路由多数写成 `def`，跑在线程池里——这是刻意的，
+    为的是让 sqlite、子进程、写盘这些阻塞动作不去占用事件循环。而 `catalog()`
+    是 async，所以这里在线程内自建一个临时事件循环跑一次。
+
+    为什么自建循环是安全的（不是碰运气）：
+      * 上游的 HTTP 客户端全部是「每次调用新建 + `async with` 用完即弃」
+        （见 `config.http_client`），**不绑定任何事件循环**，所以临时循环既不会
+        与主循环抢资源，也不会复用跨循环的连接池；
+      * 线程池里的工作线程本身没有运行中的循环，`asyncio.run` 不会撞上
+        「已有事件循环」的限制；
+      * `asyncio.run` 的信号处理只在主线程生效，工作线程里是空操作。
+
+    若当前线程**已经**在跑事件循环（正常不会发生：同步路由在线程池线程里），
+    就不敢自建第二个循环，直接返回一个"没拉到"的结果，让调用方按"取不到"处理
+    ——宁可少一个模型名，也不要在这里把请求卡死。
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    else:
+        return {'models': [], 'source': 'none', 'source_label': '', 'via': '',
+                'errors': ['当前上下文已有事件循环，未实时拉取模型清单']}
+    return asyncio.run(catalog(realm))
 
 
 def summarize(models: list[dict]) -> dict:

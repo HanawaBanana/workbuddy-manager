@@ -18,19 +18,24 @@ import {
   Loader2,
   DownloadCloud,
   FileText,
+  KeyRound,
 } from 'lucide-react';
 import {notify} from '@/lib/toast';
+import {getExpiryDailyGroup, setExpiryDailyGroup} from '@/lib/display-prefs';
 import {useI18n} from '@/lib/i18n/provider';
 import {t as tGlobal, tp as tpGlobal} from '@/lib/i18n';
 import {RichText} from '@/lib/i18n/rich-text';
 import {settingsApi, upstreamApi, errText} from '@/lib/api';
+import {UpstreamEndpoints} from '@/components/settings/UpstreamEndpoints';
 import {BASE_PATH} from '@/lib/base-path';
 import type {ModelInfo, ModelSource, UpstreamConfig, UserItem} from '@/lib/types';
 import {PageHeader} from '@/components/common/layout/PageHeader';
 import {EmptyState} from '@/components/common/layout/EmptyState';
 import {ConfirmDialog} from '@/components/common/layout/ConfirmDialog';
+import {ResetPasswordDialog} from '@/components/common/settings/ResetPasswordDialog';
 import {useAuth} from '@/lib/auth-context';
 import {UpdatePanel} from '@/components/common/settings/UpdatePanel';
+import {TokensPanel} from '@/components/common/settings/TokensPanel';
 import {ChangelogPanel} from '@/components/common/settings/ChangelogPanel';
 import {CopyButton} from '@/components/ui/copy-button';
 import {Button} from '@/components/ui/button';
@@ -802,6 +807,20 @@ export default function SettingsPage() {
   const [modelSource, setModelSource] = useState<ModelSource>('unknown');
   const [modelsLoading, setModelsLoading] = useState(false);
 
+  /**
+   * 「到期积分按天模糊统计」——**界面偏好**，存在浏览器本地而不是上游配置里。
+   *
+   * 它决定仪表盘那个数字怎么算，不改变系统的任何行为，所以不进 GROUPS：
+   * 那套分组每条都对应 config.json 的一个段，混进来会被当成上游配置去保存
+   * （保存时还会因为段名对不上而被拒）。与语言、版本切换同类。
+   *
+   * 首屏后读 localStorage：直接读会让服务端渲染与客户端不一致。
+   */
+  const [expiryDaily, setExpiryDaily] = useState(false);
+  useEffect(() => {
+    setExpiryDaily(getExpiryDailyGroup());
+  }, []);
+
   /** 可视化表单状态 */
   const [form, setForm] = useState<Record<Group, Record<string, FieldValue>>>({
     schedule: defaultValues(SCHEDULE_FIELDS),
@@ -1080,6 +1099,7 @@ export default function SettingsPage() {
           <TabsTrigger value="upstream"><Server className="mr-1.5 h-3.5 w-3.5" />{t('settings.tabUpstream')}</TabsTrigger>
           <TabsTrigger value="models"><Shuffle className="mr-1.5 h-3.5 w-3.5" />{t('settings.tabModels')}</TabsTrigger>
           <TabsTrigger value="users"><Users className="mr-1.5 h-3.5 w-3.5" />{t('settings.tabUsers')}</TabsTrigger>
+          <TabsTrigger value="tokens"><KeyRound className="mr-1.5 h-3.5 w-3.5" />{t('settings.tabTokens')}</TabsTrigger>
           <TabsTrigger value="system"><DownloadCloud className="mr-1.5 h-3.5 w-3.5" />{t('settings.tabSystem')}</TabsTrigger>
           <TabsTrigger value="changelog"><FileText className="mr-1.5 h-3.5 w-3.5" />{t('settings.tabChangelog')}</TabsTrigger>
           <TabsTrigger value="about"><Info className="mr-1.5 h-3.5 w-3.5" />{t('settings.tabAbout')}</TabsTrigger>
@@ -1088,6 +1108,10 @@ export default function SettingsPage() {
 
         {/* ═══ 上游配置 ═══ */}
         <TabsContent value="upstream" className="mt-3 space-y-3">
+          {/* 多上游（账号池分组）：密钥绑定上游 = 请求只走那个池，见 server/upstreamsvc.py。
+              放在 config.json 字段之前：它是「本端接了几个上游」的清单，
+              而下面那批字段描述的是**默认上游自身**的配置。 */}
+          <UpstreamEndpoints />
           {upstreamError && (
             <div className="flex items-start gap-2.5 rounded-[20px] border border-amber-500/30 bg-amber-500/10 p-4">
               <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0 text-amber-500" />
@@ -1208,6 +1232,32 @@ export default function SettingsPage() {
                   )}
                 </p>
               )}
+            </div>
+          </div>
+
+          {/* 界面偏好：下面那些卡片都是**上游配置**（每条对应 config.json 的一个段、
+              有保存按钮）；这一张只决定界面怎么摆，存在浏览器本地、改完立即生效，
+              所以既没有保存按钮也不受「上游不可用」影响。 */}
+          <div className="rounded-[20px] bg-muted px-3.5 py-3">
+            <div className="mb-2.5">
+              <div className="text-sm font-medium">{t('settings.displayTitle')}</div>
+              <RichText className="text-[11px] text-muted-foreground" text={t('settings.displayDesc')} />
+            </div>
+            <div className="flex items-center justify-between gap-3 rounded-2xl bg-background/60 px-3 py-2">
+              <div className="min-w-0">
+                <div className="text-xs font-medium">{t('settings.expiryDailyLabel')}</div>
+                <RichText
+                  className="mt-0.5 block text-[11px] leading-4 text-muted-foreground"
+                  text={t('settings.expiryDailyDesc')}
+                />
+              </div>
+              <Switch
+                checked={expiryDaily}
+                onCheckedChange={(v) => {
+                  setExpiryDaily(v);
+                  setExpiryDailyGroup(v);
+                }}
+              />
             </div>
           </div>
 
@@ -1821,34 +1871,17 @@ export default function SettingsPage() {
                     {isAdmin && (
                       <TableCell className="pr-4 text-right">
                         <div className="flex justify-end gap-1">
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            className="h-7 rounded-full text-xs"
-                            onClick={async () => {
-                              const pwd = window.prompt(
-                                t('settings.resetPasswordPrompt', {name: u.username}));
-                              if (!pwd) return;
-                              try {
-                                const r = await settingsApi.updateUser(u.username, {password: pwd});
-                                // 改密码会吊销该用户既有会话。若改的是自己，
-                                // 当前登录态也随之失效——必须明确告知要去重新登录，
-                                // 否则用户会以为「界面卡住了」（下次请求就是 401）。
-                                if (r?.relogin_required) {
-                                  notify.ok(t('settings.passwordUpdated'), t('settings.passwordRelogin'));
-                                  window.setTimeout(() => {
-                                    window.location.href = `${BASE_PATH}/login`;
-                                  }, 1800);
-                                  return;
-                                }
-                                notify.ok(t('settings.passwordUpdated'), t('settings.passwordOthersRevoked'));
-                              } catch (e) {
-                                notify.err(errText(e));
-                              }
-                            }}
-                          >
-                            {t('settings.resetPassword')}
-                          </Button>
+                          {/* 重置密码走与「删除用户」同一套对话框（原来这里是
+                              window.prompt，同一行里两种风格）。校验、清空、
+                              改完自己要不要重新登录等逻辑都在组件里。 */}
+                          <ResetPasswordDialog
+                            username={u.username}
+                            trigger={
+                              <Button variant="ghost" size="sm" className="h-7 rounded-full text-xs">
+                                {t('settings.resetPassword')}
+                              </Button>
+                            }
+                          />
                           <ConfirmDialog
                             title={t('settings.deleteUserTitle', {name: u.username})}
                             description={t('settings.deleteUserDesc')}
@@ -1885,6 +1918,11 @@ export default function SettingsPage() {
               />
             )}
           </div>
+        </TabsContent>
+
+        {/* ═══ 访问令牌 ═══ */}
+        <TabsContent value="tokens" className="mt-4 space-y-4">
+          <TokensPanel />
         </TabsContent>
 
         {/* ═══ 系统更新 ═══ */}

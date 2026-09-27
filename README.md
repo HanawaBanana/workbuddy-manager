@@ -7,6 +7,10 @@
 一套给 [`workbuddy2api`](https://github.com/Sliverkiss/workbuddy2api) 配套的 Web 管理端：
 扫码批量纳管账号、自动签到、密钥分发、IP 管控、调用日志与用量统计，一个面板全搞定。
 
+> 上游 workbuddy2api 的源码**随本项目的发布包一起分发**（MIT）。
+> 已部署的不受影响；重装 / 迁移时怎么取得源码，见
+> [部署指南的开头一节](deploy/README.md#〇上游源码从哪来随发布包分发)。
+
 ![Next.js](https://img.shields.io/badge/Next.js-15-000000?logo=nextdotjs&logoColor=white)
 ![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=white)
 ![TypeScript](https://img.shields.io/badge/TypeScript-5-3178C6?logo=typescript&logoColor=white)
@@ -32,7 +36,7 @@
 
 ## 这是什么
 
-[`workbuddy2api`](https://github.com/Sliverkiss/workbuddy2api) 是一个把腾讯 CodeBuddy 账号池包装成 OpenAI 兼容接口的反代服务（Go 编写）。它的能力很完整，但只有命令行：加账号要跑脚本、看状态要 `curl /status`、发密钥没有界面。
+`workbuddy2api` 是一个把腾讯 CodeBuddy 账号池包装成 OpenAI 兼容接口的反代服务（Go 编写）。它的能力很完整，但只有命令行：加账号要跑脚本、看状态要 `curl /status`、发密钥没有界面。
 
 本项目补上这一块 —— 一个可以公网运营的 Web 控制台：
 
@@ -56,9 +60,9 @@
   一起把这个生态做得更好用
 - **上游专注自己的核心**：面板不要求上游为它改代码，让上游能保持精简
 
-欢迎参与共建：上游的改进建议提到
-[workbuddy2api](https://github.com/Sliverkiss/workbuddy2api)，面板相关的问题与想法
-提到[本仓库](https://github.com/ithtelab/workbuddy-manager/issues)。
+欢迎参与共建：面板与上游源码的问题、想法都提到
+[本仓库](https://github.com/ithtelab/workbuddy-manager/issues)
+（上游源码随本项目的发布包分发）。
 
 ---
 
@@ -87,6 +91,25 @@
   扫码）。停用期间**不被选中处理对话，但签到与令牌保活照常执行**，积分与凭证都是
   活的，随时可以启用回来（上游版本较旧时会自动回退到「完全退出账号池」的方式，
   并在提示里说明差别）
+- **账号分组（多账号池）** —— 页面顶部按分组查看与切换账号：默认分组就是升级前那套；
+  点「添加分组」——**只填名称就行**（其余字段不再出现：上游地址默认沿用默认分组的、
+  `api_key` 留空时与默认分组同址自动沿用默认分组的钥匙、账号目录自动带出建议路径）。
+  要接第二套实例或自定义目录，到「设置 → 上游」把地址、`api_key` 与**账号目录**
+  改成那套实例的（账号目录一致才能在面板里管理这一组的账号）。
+  - **对外只有一个地址就够了**：客户端始终只填「管理器地址 + 密钥」；每个分组的
+    上游实例只在服务器内部监听（如默认组 `127.0.0.1:7863`、乙组 `127.0.0.1:7865`），
+    不占公网端口、也不需要额外域名。第二套实例的起法与第一套相同：把上游目录复制
+    一份，改 `config.json` 里的 `listen` / `auth_dir` / `state_file` / `api_key`
+    再拉起（Docker 用户复制 compose、改容器名与端口映射即可）。账号行有「移动到分组」，
+  把账号从默认分组转移进任意分组；移动的是账号文件本身，**凭证一个字节不改**，
+  目标已有同名文件时会拒绝（覆盖会丢掉那一份凭据）。密钥绑定哪个分组，请求就只走
+  哪一组的账号（见「反代网关 → 多上游」）。**没配置账号目录的分组只做密钥转发**：
+  账号页对它只读，添加 / 移动 / 删除会明确报错，绝不悄悄落到默认分组
+  - **和默认分组同址（共用同一套实例）的分组，账号同样不会被加载**：账号文件在面板
+    这边分开放，而上游只读它自己那份账号目录——所以这一组的账号（包括在这一组里新
+    扫码加的）会一直显示「未加载」，转发与签到都不会用到它们。要真正把账号池分开，
+    必须再部署一套实例并把这一组的「上游地址」指过去（如 `127.0.0.1:7865`）；
+    账号页选中这类分组时会就地提示这一点。
 - **积分变动流水** —— 所有让余额增加的渠道都会留痕：上游只在旅行领奖时打日志，
   签到与活跃上报**根本不打**，因此改为每次查积分后比对余额、只要增加就记一条
   （如 `余额 +100（1300 → 1400）`），在「自动任务与积分记录」里按「积分变动」筛选查看
@@ -108,6 +131,11 @@
 - **OpenAI 兼容** —— 下游用标准 SDK 直连，支持流式（SSE）与非流式
 - **多密钥分发** —— 每把密钥独立设置**限定版本**（国内版 / 国际版）、有效期、最大 IP 数、IP 白名单、模型白名单、Token 配额
 - **密钥安全** —— 库中仅存 SHA-256 哈希，明文只在创建时展示一次
+- **多上游（账号池分组）** —— 「设置 → 上游」可配置多个上游（各自的地址与 `api_key`）；
+  密钥可绑定其中一个，请求只走那个上游的账号池（不绑定 = 默认上游，行为与单上游部署一致）。
+  上游被停用 / 删除后，绑在它上面的密钥**明确报错**而不会悄悄回落到默认上游——回落
+  等于隔离失效，而且是不会有人发现的那种失效。账号管理页的「分组」就是这里的上游：
+  可以按分组查看 / 加号 / 移动账号（移动需要该上游登记了本地账号目录）
 - **模型别名映射** —— 把 `gpt-4o-mini` 之类映射到实际模型，方便下游无感迁移
 - **国内版 / 国际版切换** —— 页面右上角一键切换（上游单实例双版本共存，共用账号池）：
   账号、模型、测试台、任务记录、请求日志与用量统计全部按版本过滤；「添加账号」跟随切换
@@ -138,6 +166,9 @@
 - **并发与熔断**：单账号并发、失败阈值、熔断冷却与封顶、闲置补偿权重、
   快过期积分窗口（到期在窗口内的积分优先消耗，留空或 0 = 关闭）
 - **功能开关 / 会话粘性**：出站指纹脱敏、会话绑定时长与清理周期
+- **上游接入点**：增删改多个上游并逐个「探测」连通性；密钥绑定上游即账号池分组
+  （默认上游来自环境变量 / 上游 config.json，只展示、不可改）；另可登记该分组的
+  **本地账号目录**（账号页按它管理账号）与**容器名**（「重启该分组」按它重启）
 - **可用模型**：从上游实时拉取，如实标注来源，并提供
   手动「重新拉取」（上游自身缓存 1 小时）。列表由上游随机挑一个账号拉取，
   **取决于该账号授权**，故不同账号可见的模型数量可能不同
@@ -233,14 +264,20 @@
 <img src="docs/images/keys.png" alt="API 密钥" width="100%" />
 
 ### 请求日志
-> 按时间 / 密钥 / 状态 / 模型 / IP 筛选，含**首字延迟**、总耗时、Token 计量与**提示词缓存命中**
+> 按时间 / 密钥 / 状态 / 模型 / IP 筛选，含**实际调用账号**、**首字延迟**、总耗时、Token 计量与**提示词缓存命中**
 
 「首字」= 从发起上游请求到收到第一个含正文的 delta，反映**上游响应快慢**；
 「总耗时」含模型生成全程，回答越长越大，用于看单次请求的整体开销。
 非流式请求没有中间过程，首字显示 `—`。
 
+**账号**是这次调用实际落在哪个上游号上，形如 `张叔叔(299e342b)`。账号由上游选择、
+也不在响应里回传，本面板是读上游的容器日志再按时间对回去的，所以**比请求晚几秒**
+才补上（刚打完的请求可能还是 `—`）；容器日志读不到时（上游不在本机、没挂
+`docker.sock`、原生部署）这一列一直是 `—`，不影响其余功能。
+
 Token 后面的缓存标记（绿色「缓存 N%」/ 琥珀色「未命中」）来自上游返回的用量数据，
-用来判断同一段前缀**有没有真的吃到缓存**——命中部分计费便宜得多。上游不返回这项数据时
+用来判断同一段前缀**有没有真的吃到缓存**——命中部分计费便宜得多。前缀缓存按账号存，
+所以「换了账号」与「没命中」常常一起出现，配合账号列一起看。上游不返回这项数据时
 标记不显示（详情里写「未采集」），与「没有命中」不是一回事。
 
 <img src="docs/images/logs.png" alt="请求日志" width="100%" />
@@ -483,9 +520,10 @@ docker pull ghcr.io/<你的用户名>/workbuddy-manager-multiarch:latest
 
 ### 四、部署到服务器（一键脚本）
 
-本项目依赖上游 [`workbuddy2api`](https://github.com/Sliverkiss/workbuddy2api)
-（账号池与 OpenAI 兼容接口），**单独 clone 本仓库无法运行**。
-为此提供了一键脚本，会在干净机器上自动装好两者：
+本项目依赖上游 workbuddy2api（账号池与 OpenAI 兼容接口），**单独 clone 本仓库无法运行**。
+**发布包里已自带上游源码**（源码由本项目随包分发），
+一键脚本会装好两者；要改用自己那份源码见
+[部署指南](deploy/README.md#〇上游源码从哪来随发布包分发)：
 
 ```bash
 # 推荐：用 Release 包（内含已构建的前端，无需 Node.js）
@@ -567,6 +605,9 @@ journalctl -u workbuddy-web | grep -A3 '初始管理员'
 - **限定版本** —— 国内版密钥只能调国内版模型，国际版密钥只能调 `global:` 开头的
   国际版模型，跨版本调用会被拒绝（`/v1/models` 也只返回对应版本的模型）。
   默认跟随当前所在版本；选「不限制」则两版都能调
+- **绑定上游** —— 在「设置 → 上游」里配了多个上游之后，这里可以选一个：这把密钥的
+  请求只走那个上游的账号池（不选 = 默认上游，即 `WB2API_BASE` 那一套）。
+  把密钥分给不同的人 / 业务时，用它做账号池隔离
 - **有效期** —— 留空或 0 表示永不过期
 - **最大 IP 数** —— 限制同一密钥可使用的来源 IP 数量
 - **IP 白名单** —— 更严格，仅允许指定 IP / CIDR 调用
@@ -698,7 +739,9 @@ export ANTHROPIC_MODEL=glm-5.2
 | `POST` | `/api/auth/start` `/api/auth/poll` | 管理员 | 扫码授权流程 |
 | `POST` | `/api/accounts/{file}/checkin` `/test` `/refresh` | 管理员 | 签到 / 测活 / 刷新 |
 | `DELETE` | `/api/accounts/{file}` | 管理员 | 删除账号 |
-| `GET/POST/PATCH/DELETE` | `/api/keys[/{id}]` | 会话 / 管理员 | 密钥管理 |
+| `GET/POST/PATCH/DELETE` | `/api/keys[/{id}]` | 会话 / 管理员 | 密钥管理（发给下游调模型） |
+| `GET/POST/PATCH/DELETE` | `/api/upstreams[/{id}]` | 会话（管理员） | 多上游接入点（密钥绑定上游 = 账号池分组）；`POST /api/upstreams/{id}/probe` 探测连通性 |
+| `GET/POST/PATCH/DELETE` | `/api/tokens[/{id}]` | 会话（管理员） | 管理面 API Token（给脚本 / CI，见 [docs/api-tokens.md](docs/api-tokens.md)） |
 | `GET` | `/api/logs` `/api/stats/*` | 会话 | 日志与用量 |
 | `GET/POST/DELETE` | `/api/security/*` | 会话 / 管理员 | IP 规则与审计 |
 | `GET/POST` | `/api/settings/*` | 会话 / 管理员 | 上游配置、模型映射 |
@@ -745,6 +788,9 @@ workbuddy-manager/
 - **真实 IP 取自反代覆盖写入的 `X-Real-IP`**（`X-Forwarded-For` 首段可伪造），
   避免 IP 白/黑名单、每密钥 IP 限制与登录锁定被冒充绕过
 - 登录失败**按 IP + 用户名双维度锁定**，防单机与换 IP 的分布式爆破
+- 管理面支持**作用域化 API Token**（只读 / 管理员，可吊销、可过期，库中仅存哈希、
+  全程审计），供脚本 / CI 免登录调用；**高危接口与令牌管理本身只接受会话登录**，
+  令牌泄露也无法提权或自助持久化（见 [docs/api-tokens.md](docs/api-tokens.md)）
 - 生产环境默认关闭 `/docs`、`/openapi.json`（`WB_ENABLE_DOCS=1` 开启）
 - 网关限制请求体大小（8 MiB）与每密钥调用频率（默认 120 次/分钟）
 - 已配置 CSP、`X-Frame-Options`、`X-Content-Type-Options` 等安全响应头
@@ -788,7 +834,8 @@ workbuddy-manager/
   [功能建议](https://github.com/ithtelab/workbuddy-manager/issues/new?template=feature_request.yml)
 
 > 反馈时请附上版本号与错误日志，并**先移除其中的密钥、Token 等敏感信息**。
-> 上游 workbuddy2api 自身的问题请在其[仓库](https://github.com/Sliverkiss/workbuddy2api)反馈。
+> 上游 workbuddy2api 自身的问题也提到[本仓库](https://github.com/ithtelab/workbuddy-manager/issues)
+> ——上游源码随本项目的发布包分发。
 
 ### 版本发布流程
 
@@ -823,11 +870,21 @@ CI 会构建前端、打包产物、从 CHANGELOG 提取对应版本段落作为
 
 ---
 
+## 相关项目
+
+- [**sanguine886/workbuddy-sdk**](https://github.com/sanguine886/workbuddy-sdk)（Go，MIT）——
+  社区维护的 Go 客户端库，完整覆盖本项目的两个 API 面：管理面 `/api/*`（账号池、密钥、
+  统计、日志、安全、设置、用户、系统更新）与数据面 `/v1/*`（Chat Completions /
+  Responses / Anthropic Messages / Models）。用 Go 写运维工具时可直接 `go get`，
+  不必自己拼 HTTP 与登录态。
+
+> 以上为社区项目，**与本仓库无代码依赖**；使用中遇到问题请到其[仓库](https://github.com/sanguine886/workbuddy-sdk/issues)反馈。
+
 ## 致谢
 
 - [**LINUX DO**](https://linux.do) —— 本项目的发布与交流社区
 - [**linux-do/cdk**](https://github.com/linux-do/cdk)（MIT）—— 界面设计令牌与浮动底栏组件来源，本项目 UI 视觉与其保持一致
-- [**Sliverkiss/workbuddy2api**](https://github.com/Sliverkiss/workbuddy2api) —— 底层账号池与 OpenAI 兼容代理
+- [**Sliverkiss/workbuddy2api**](https://github.com/Sliverkiss/workbuddy2api) —— 底层账号池与 OpenAI 兼容代理（MIT；源码随本项目的发布包分发，版权归原作者）
 - [**lbjlaq/Antigravity-Manager**](https://github.com/lbjlaq/Antigravity-Manager) —— 管理端功能形态参考
 
 ## License

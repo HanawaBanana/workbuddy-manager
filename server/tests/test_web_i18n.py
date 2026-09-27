@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+import ast
 import json
 import re
 import sys
@@ -52,6 +53,51 @@ _T_ALIAS_KEY = re.compile(
 
 def _load(locale: str) -> dict:
     return json.loads((_LOCALES_DIR / f'{locale}.json').read_text(encoding='utf-8'))
+
+
+def _backend_403_details() -> tuple[dict[str, str], list[str]]:
+    """扫出后端所有 `HTTPException(status_code=403, …)` 的 detail 文案。
+
+    返回 (字面量文案 → 出处, 非字面量的位置)。用 ast 而不是正则：`keys.py`
+    里有跨行相邻字符串字面量的写法，正则要额外处理隐式拼接，而 ast 已经把相邻
+    字面量合并成一个 Constant 了。
+
+    非字面量的（f-string 之类）单独返回而不是忽略——否则将来加一条拼接出来的
+    403 文案就会静默绕过这道守卫，而「静默绕过」正是本文件要防的东西。
+    """
+    literal: dict[str, str] = {}
+    dynamic: list[str] = []
+    for path in sorted((_ROOT / 'server').rglob('*.py')):
+        tree = ast.parse(path.read_text(encoding='utf-8'))
+        rel = path.relative_to(_ROOT).as_posix()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, 'id', '')
+            if name != 'HTTPException':
+                continue
+            # 状态码与 detail 既可能写成关键字，也可能按位置传。
+            status = detail = None
+            if len(node.args) >= 2:
+                status, detail = node.args[0], node.args[1]
+            for kw in node.keywords:
+                if kw.arg == 'status_code':
+                    status = kw.value
+                elif kw.arg == 'detail':
+                    detail = kw.value
+            if status is None or detail is None:
+                continue
+            try:
+                if ast.literal_eval(status) != 403:
+                    continue
+            except (ValueError, TypeError):
+                continue
+            if isinstance(detail, ast.Constant) and isinstance(detail.value, str):
+                literal.setdefault(detail.value, rel)
+            else:
+                dynamic.append(f'{rel}:{node.lineno}')
+    return literal, dynamic
 
 
 def _flatten(node, prefix: str = '') -> dict[str, object]:
@@ -152,6 +198,40 @@ class WebLocaleTest(unittest.TestCase):
         ]
         self.assertEqual(offenders, [], f'en 里有 {len(offenders)} 处未翻译的中文：{offenders[:10]}')
 
+    def test_no_duplicate_keys(self) -> None:
+        """同一个段里**不能出现重复键**——JSON 会静默取最后一条，界面于是显示错的那句。
+
+        为什么单独一条：上面所有检查都走 `json.loads`，而它遇到重复键**不报错**、
+        直接保留最后一个（`object_pairs_hook` 才看得到）。所以「两个分支各加了同名
+        键、合并时挤在一起」这种事故，键集、空译文、占位符全都查不出来，
+        只有肉眼看 diff 才发现 —— 评审一次真实合并时就撞上过（同一个键一个写
+        「缓存命中」一个写「缓存命中 Token」，最终库里留下的取决于行序）。
+
+        做法是**按文本**逐行找，不用 json：每行 `"key": ...` 记一次出现。
+        """
+        offenders: dict[str, list[str]] = {}
+        for locale in _LOCALES:
+            path = _LOCALES_DIR / f'{locale}.json'
+            section = '?'
+            seen: dict[tuple[str, str], int] = {}
+            for lineno, line in enumerate(
+                    path.read_text(encoding='utf-8').splitlines(), start=1):
+                m = re.match(r'^  "([^"]+)": \{\s*$', line)   # 顶层段名
+                if m:
+                    section = m.group(1)
+                    continue
+                m = re.match(r'^    "([^"]+)":', line)        # 段内键
+                if not m:
+                    continue
+                key = (section, m.group(1))
+                if key in seen:
+                    offenders.setdefault(f'{locale}.{section}.{m.group(1)}',
+                                         []).append(f'第 {seen[key]} 行与第 {lineno} 行')
+                else:
+                    seen[key] = lineno
+        self.assertEqual(offenders, {},
+                         f'语言文件里有重复键（JSON 只会保留最后一条）：{offenders}')
+
 
 class WebKeyUsageTest(unittest.TestCase):
     """源码里写死的 t('...') 键必须真的存在于字典。
@@ -249,6 +329,37 @@ class WebPhraseTest(unittest.TestCase):
     def test_english_phrases_have_no_han(self) -> None:
         offenders = [key for key, value in self.phrases['en'].items() if _HAN.search(value)]
         self.assertEqual(offenders, [], f'en.phrases 里有 {len(offenders)} 条未翻译：{offenders[:5]}')
+
+    def test_backend_403_details_are_translatable(self) -> None:
+        """后端每条 403 的 detail 文案都必须在短语表里有译文。
+
+        为什么单列一条：403 是「你被拒绝了」，用户必须看懂**为什么**被拒才知道
+        下一步做什么——去找管理员开权限、换会话登录、去 .env 里打开开关，处置
+        方式完全不同。这些文案写在后端、由 `errText` 过短语表翻译，而短语表是
+        **按整串精确匹配**的：少一个字、多一个标点就静默退回中文原文，不报错、
+        不显示键名，只能靠人在英文界面上逐条肉眼比对。
+
+        实测就漏过两条（做 P0-5 时发现）：
+          · `刷新积分需要管理员权限` —— 与已收录的 `需要管理员权限` 只差三个字，
+            精确匹配于是命中不了；
+          · `该接口不接受 API Token，请用会话登录后操作`。
+
+        这也解释了为什么 403 **不能**在前端统一改写成「权限不足」：本项目的 403
+        有四种含义，其中「本机导入开关没开」「调用方不是面板所在机器」两条原文
+        就是可照做的操作说明，改写会把用户唯一能照着做的那句话抹掉。
+        """
+        literal, dynamic = _backend_403_details()
+        self.assertEqual(dynamic, [],
+                         f'有 {len(dynamic)} 处 403 文案是拼出来的，守卫查不了：{dynamic}')
+        # 先确认扫描真的抓到了东西，免得正则/AST 失配后测试空转照样绿
+        self.assertIn('需要管理员权限', literal, '没扫到已知的 403 文案 —— 扫描失效了（会假通过）')
+        for code in ('en', 'ja', 'ko', 'zh-TW'):
+            missing = sorted(text for text in literal if text not in self.phrases[code])
+            detail = '; '.join(f'{text[:24]}… ← {literal[text]}' for text in missing[:5])
+            self.assertEqual(
+                missing, [],
+                f'{code} 的短语表缺 {len(missing)} 条 403 文案'
+                f'（这些在非中文界面下会退回中文）：{detail}')
 
     def test_setting_field_concats_have_translations(self) -> None:
         """设置页里**用 `+` 拼接**的字段文案必须在短语表里有条目。

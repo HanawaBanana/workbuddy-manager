@@ -35,7 +35,7 @@ import uuid
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from .. import config, db, iputil, keysvc
+from .. import config, db, iputil, keysvc, upstreamsvc
 from ..routers.security import get_config as get_security_config
 # responses 只为复用推理凭据的编解码（`_encode_credential` / `_decode_credential`）：
 # Anthropic 的 `signature` 与 Responses 的 `encrypted_content` 语义完全相同——
@@ -554,6 +554,15 @@ def _thinking_enabled(body: dict) -> bool:
     Anthropic 的形状是 `thinking: {'type': 'enabled', 'budget_tokens': N}`；
     关闭时客户端会写 `{'type': 'disabled'}` 或干脆不带这个字段。两种都算没启用。
 
+    **`adaptive` 同样算启用**：新版 Claude Code 对「模型自适应决定思考量」的模型
+    发 `{'type': 'adaptive', 'display': ...}`（无 `budget_tokens`）。而它判断一个
+    模型是否支持 adaptive 的依据是**模型名是否在它的官方能力表里**——本地网关
+    后面挂的 `cn:deepseek-v4-flash` 这类第三方模型名一律查不到，于是**全部**回落
+    到 `adaptive`。只认 `enabled` 会让这些请求的推理在网关这一跳被整段丢弃：
+    上游照常思考（`output_config.effort` 也照常传），但客户端一个 `thinking_delta`
+    都收不到，表现为「思考过程不可见、`thinking_tokens` 恒为 0」。
+    两种 type 对网关的语义相同——客户端能接受 thinking 块——因此都回。
+
     宽容处理**畸形值**：不是 dict、或缺 type，都按「没启用」—— 宁可少回一个
     thinking 块（客户端拿不到凭据时只是多花点 token 重新思考），也不要对着
     一个不认这种块的客户端硬塞。
@@ -561,7 +570,7 @@ def _thinking_enabled(body: dict) -> bool:
     think = body.get('thinking')
     if not isinstance(think, dict):
         return False
-    return str(think.get('type') or '').lower() == 'enabled'
+    return str(think.get('type') or '').lower() in ('enabled', 'adaptive')
 
 
 # Anthropic 的 `output_config.effort` → 上游 `reasoning_effort` 的档位映射。
@@ -996,13 +1005,21 @@ async def messages(request: Request):
         if isinstance(payload['stream_options'], dict):
             payload['stream_options'].setdefault('include_usage', True)
 
-    url = f'{config.WB2API_BASE}/v1/chat/completions'
+    # 上游按密钥解析（多上游 / 分组隔离）；绑定缺失或停用时明确报错，不回落。
+    try:
+        upstream = upstreamsvc.resolve_for_key(key)
+    except upstreamsvc.UpstreamUnavailable as exc:
+        gateway._record(key, ip, model, mapped or '', 503, 0, 0, 0, ua, str(exc), False)
+        # anthropic 的错误体没有 code 字段（只有 type），故第三参给 type
+        return _err(str(exc), 503, 'api_error')
+    url = f'{upstream["base_url"]}/v1/chat/completions'
     started = time.time()
 
     if not stream:
         try:
             async with config.http_client(config.UPSTREAM_TIMEOUT, connect=5) as client:
-                resp = await client.post(url, json=payload, headers=gateway._upstream_headers())
+                resp = await client.post(url, json=payload,
+                                         headers=gateway._upstream_headers(upstream))
             latency = int((time.time() - started) * 1000)
             usage: dict = {}
             try:
@@ -1037,7 +1054,8 @@ async def messages(request: Request):
     # ── 流式 ────────────────────────────────────────────────
     client = config.http_client(config.UPSTREAM_TIMEOUT, connect=5)
     try:
-        req = client.build_request('POST', url, json=payload, headers=gateway._upstream_headers())
+        req = client.build_request('POST', url, json=payload,
+                                   headers=gateway._upstream_headers(upstream))
         resp = await client.send(req, stream=True)
     except Exception as exc:  # noqa: BLE001
         await client.aclose()

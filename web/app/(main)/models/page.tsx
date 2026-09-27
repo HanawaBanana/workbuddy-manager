@@ -201,7 +201,7 @@ export default function ModelsPage() {
       if (series !== 'all' && m.series !== series) return false;
       if (cap === 'reasoning' && m.efforts.length === 0) return false;
       if (cap === 'large' && (m.context_length || 0) < 131072) return false;
-      if (cap === 'vision' && !m.supports_images) return false;
+      if (cap === 'vision' && m.native_modality !== 'multimodal') return false;
       if (!kw) return true;
       return (
         m.id.toLowerCase().includes(kw) ||
@@ -501,9 +501,9 @@ export default function ModelsPage() {
                         <div className="flex flex-wrap items-center justify-end gap-1.5">
                           {/* 积分倍率已升级为独立「价格」列（见上方价格单元格），
                               这里不再重复显示，免得同一数字出现在一行两处 */}
-                          {m.supports_images && (
-                            <Badge variant="secondary" className="rounded-md text-[10px]" title={t('models.visionTitle')}>
-                              {t('models.vision')}
+                          {(
+                            <Badge variant="secondary" className="rounded-md text-[10px]" title={t('models.visionTitle') + ' · ' + (m.native_modality_source || '') + ' ' + (m.native_modality_verified_at || '')}>
+                              {t(m.native_modality === 'multimodal' ? 'models.vision' : m.native_modality === 'text' ? 'models.visionNo' : m.native_modality === 'router' ? 'models.visionRouter' : 'models.visionUnknown')}
                             </Badge>
                           )}
                           {m.only_reasoning && (

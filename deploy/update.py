@@ -20,7 +20,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import http.client
 import os
+import re
 import shutil
 import signal
 import stat
@@ -32,6 +34,23 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+
+def _force_utf8_stdio() -> None:
+    """中文 Windows 上重定向 stdout/stderr 默认 cp936（GBK）：print('✓'/'⚠️')
+    会 UnicodeEncodeError 直接杀死更新进程（时间戳前缀 11 字符 + ✓ 正是
+    'position 11' 报错的来源）。无论由谁启动、stdout 重定向到哪，这里
+    自我防御：stdio 强制 UTF-8，个别无法编码的字符以 replace 兜底，
+    日志绝不因此中断。"""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding='utf-8', errors='replace')
+        except (AttributeError, ValueError, OSError):
+            pass
+
+
+_force_utf8_stdio()
+
 
 # ── 运行环境（与 server/config.py 保持一致的默认值）──────────
 INSTALL_DIR = Path(os.environ.get('WB_INSTALL_DIR') or Path(__file__).resolve().parent.parent)
@@ -188,10 +207,36 @@ def http_json(url: str, timeout: int = 20) -> dict:
 
 
 def download(url: str, dest: Path, rep: Reporter) -> None:
+    """下载 Release 资产到 dest。
+
+    timeout=120 是**单次 socket 操作**的超时（只在无数据流动时计时），不是
+    总时长——代理/TUN 链路慢时全量下载远超 120 秒属正常，不会被它中断。
+    对偶发网络失败（连接重置、响应中断、5xx）自动重试一次：更新是低频操作，
+    多花一次下载的代价远小于整次更新失败；4xx 是请求本身的问题（版本不存在、
+    地址错），重试不会变好，直接抛出。
+    """
     rep.log(f'下载 {url}')
-    req = urllib.request.Request(url, headers={'User-Agent': 'workbuddy-manager-updater'})
-    with urllib.request.urlopen(req, timeout=120) as resp, open(dest, 'wb') as fh:
-        shutil.copyfileobj(resp, fh)
+    last: BaseException | None = None
+    for attempt in (1, 2):
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'workbuddy-manager-updater'})
+            with urllib.request.urlopen(req, timeout=120) as resp, open(dest, 'wb') as fh:
+                shutil.copyfileobj(resp, fh)
+            last = None
+            break
+        except urllib.error.HTTPError as exc:
+            if exc.code < 500:
+                raise
+            last = exc
+        except (OSError, http.client.HTTPException) as exc:
+            # URLError/socket.timeout/ConnectionReset 等都是 OSError 子类；
+            # IncompleteRead 走 HTTPException。两类都值得再试一次。
+            last = exc
+        if attempt == 1:
+            rep.log(f'下载失败（{last}），自动重试一次…', 'warn')
+    if last is not None:
+        raise last
+
     size = dest.stat().st_size
     rep.log(f'  完成（{size / 1024 / 1024:.2f} MB）')
     if size < 100_000:
@@ -358,11 +403,109 @@ def _compose_looks_customized(rep: Reporter) -> bool:
         return False
 
 
+def _sync_bundled_upstream(src: Path, rep: Reporter) -> int:
+    """把发布包内自带的上游源码同步进 `UPSTREAM_DIR`（保留用户数据与定制）。
+
+    返回**改动文件数**（改写的 + 新增的）；0 表示没变或本次不适用——
+    调用方据此决定要不要重建上游容器（源码没变就不该白等一次构建）。
+
+    上游仓库的公开地址已不可用，源码随面板的 Release 包分发（包内 `upstream/`）。
+    在这里同步而不是在 `update_upstream` 里另下载一份，是因为**包是验过签的**：
+    上游代码由此也落在签名信任链里；而 `update_upstream` 的 git 拉取没有这层保证。
+
+    三条克制：
+      · 只处理**非 git** 的上游目录 —— git 部署有自己的通道（拉远端），那份源码
+        可能比包内的新，拿包内的覆盖它是倒退；
+      · 顶层 `config.json` / `auths/` / `data/` 一律不动（api_key、账号凭据、运行数据）；
+      · 只增改、不删除：包里没有的文件保留原地（宁可留旧文件，也不误删用户的）。
+    """
+    incoming = src / 'docker-compose.yml'
+    if not incoming.is_file():
+        rep.log('本次包内未含上游源码（upstream/），跳过上游代码同步')
+        return 0
+    if not (UPSTREAM_DIR / 'docker-compose.yml').is_file():
+        rep.log(f'{UPSTREAM_DIR} 里还没有上游源码，跳过同步'
+                '（首次安装上游请用 deploy/install.sh，它会用包内的 upstream/）', 'warn')
+        return 0
+    if (UPSTREAM_DIR / '.git').is_dir():
+        rep.log('上游是 git 部署：由上面的 git 流程更新，不覆盖包内源码')
+        return 0
+
+    # 用户对 compose 的定制（加网络 / 改卷 / 改端口之外的东西）要保住。
+    # 没有 git 可比，就拿「包内那份」当基准：两边都归一化掉我们的端口收敛，
+    # 不一致就说明本地有额外改动（issue #28 的情形）。
+    local_compose = UPSTREAM_DIR / 'docker-compose.yml'
+    keep_compose: str | None = None
+    try:
+        local_text = local_compose.read_text(encoding='utf-8')
+        if _port_converged(local_text).strip() != _port_converged(
+                incoming.read_text(encoding='utf-8')).strip():
+            keep_compose = local_text
+            rep.log('检测到 docker-compose.yml 有本地定制，同步后原样恢复')
+    except OSError:
+        pass
+
+    skip_top = {'config.json', 'auths', 'data'}
+    changed = 0
+    added = 0
+    for f in sorted(src.rglob('*')):
+        if not f.is_file():
+            continue
+        rel = f.relative_to(src)
+        if rel.parts[0] in skip_top or '.git' in rel.parts or '__pycache__' in rel.parts:
+            continue
+        dst = UPSTREAM_DIR / rel
+        try:
+            if dst.is_file():
+                if dst.read_bytes() == f.read_bytes():
+                    continue
+                changed += 1
+            else:
+                added += 1
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(f, dst)
+            shutil.copymode(f, dst)
+        except OSError as exc:
+            rep.log(f'  同步 {rel} 失败：{exc}', 'warn')
+
+    if keep_compose is not None:
+        local_compose.write_text(keep_compose, encoding='utf-8')
+    if changed or added:
+        rep.log(f'上游源码已随包更新：改写 {changed} 个、新增 {added} 个文件')
+    else:
+        rep.log('上游源码与包内一致，无需改动')
+    return changed + added
+
+
+def _fetch_failed_hint(out: str, pinned: str = '') -> str:
+    """拉取上游失败时给用户的话——分清「远端没了」与「网络/引用有问题」。
+
+    上游原仓库（Sliverkiss/workbuddy2api）自 2026-09-23 起已不可访问。
+    git 在这种情况下的报错是 `Repository not found` / `could not read from remote`，
+    直接透出去容易被当成网络抖动，用户会反复重试同一个必然失败的地址。
+    """
+    low = (out or '').lower()
+    # 注意别写成「repo**sitory** not found」这种连在一起的写法：git 的原文是
+    # `repository 'https://…' not found`，中间夹着地址，连写匹配不上（头一版就栽在这）。
+    gone = (re.search(r'repository .*not found', low) is not None
+            or 'does not appear to be a git repository' in low
+            or 'could not read from remote repository' in low)
+    target = f'上游 {pinned}' if pinned else '上游'
+    if gone:
+        return (f'{target}的远端仓库取不到代码（发布包分发的那份不受影响）。\n'
+                '  本次沿用现有源码继续。要更新上游代码：管理端一键更新会带上包内那份；\n'
+                '  也可以把 WB_UPSTREAM_REPO 指向你自己的副本，或用 UPSTREAM_SRC 换一份源码\n'
+                '  （见 deploy/README.md 的「上游源码从哪来」）。')
+    return (f'{target}拉取失败（提交/标签是否存在？网络是否正常？）'
+            + (f'：{out.strip()[:200]}' if out.strip() else ''))
+
+
 def update_upstream(rep: Reporter) -> None:
     rep.step('更新上游 workbuddy2api')
 
     if not (UPSTREAM_DIR / '.git').is_dir():
-        rep.log(f'{UPSTREAM_DIR} 不是 git 仓库，跳过上游更新', 'warn')
+        rep.log(f'{UPSTREAM_DIR} 是随包分发的上游（不是 git 仓库）：'
+                '代码随管理端一起更新，本次不单独更新上游')
         return
 
     which = shutil.which('git')
@@ -413,7 +556,7 @@ def update_upstream(rep: Reporter) -> None:
             rep.log('按提交直接拉取失败，尝试完整拉取…', 'warn')
             rc, out = run(['git', 'fetch', 'origin'], cwd=UPSTREAM_DIR, rep=rep, check=False)
         if rc != 0:
-            raise RuntimeError(f'拉取上游 {pinned} 失败（提交/标签是否存在？网络是否正常？）')
+            raise RuntimeError(_fetch_failed_hint(out, pinned))
         rc, out = run(['git', 'reset', '--hard', 'FETCH_HEAD'], cwd=UPSTREAM_DIR, rep=rep, check=False)
         if rc != 0:
             rc, out = run(['git', 'reset', '--hard', pinned], cwd=UPSTREAM_DIR, rep=rep, check=False)
@@ -423,7 +566,10 @@ def update_upstream(rep: Reporter) -> None:
         rep.log('拉取上游最新代码…')
         rc, out = run(['git', 'fetch', '--depth', '1', 'origin'], cwd=UPSTREAM_DIR, rep=rep, check=False)
         if rc != 0:
-            rep.log('git fetch 失败（网络问题？）', 'warn')
+            # 拉不到不致命：下面会沿用现有代码继续重建容器（本地源码是好的）。
+            # 但**原因要如实说**——原先一律写「网络问题？」，而上游原仓库
+            # 2026-09-23 起不再可用，用户照那句话去查网络只会白费功夫。
+            rep.log(_fetch_failed_hint(out), 'warn')
         branch = 'master'
         rc, out = run(['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=UPSTREAM_DIR, rep=rep, check=False)
         cur = out.strip() if rc == 0 else ''
@@ -462,8 +608,25 @@ def update_upstream(rep: Reporter) -> None:
     # 4) 恢复安全基线
     enforce_local_bind(rep)
 
-    # 5) 构建前预检：上游偶尔会漏改 Dockerfile（删了文件却仍在 COPY），
-    #    提前查出来，避免只看到 docker 那串难懂的报错
+    # 5) 预检 + 重建 + 等待就绪（见 rebuild_upstream）
+    rebuild_upstream(rep)
+
+    # 6) 清版本检测缓存
+    #
+    # 缓存里存的是「更新前」查到的远端最新提交；不清的话，界面会把**已经装好的
+    # 这个版本**当成新版本继续提示「上游有更新」，一直到缓存 6 小时过期为止
+    # （用户报过这个问题：明明更新到最新了，面板还是一直说有更新）。
+    # 管理端更新那条路径早就清了，上游这条一直漏着。
+    _clear_version_cache(rep)
+
+
+def rebuild_upstream(rep: Reporter) -> None:
+    """预检 Dockerfile → 重建上游容器 → 等待就绪。
+
+    抽出来是因为它有**两个调用点**：
+      · 常规的上游更新（上面那段 git 流程之后）；
+      · 面板更新时同步了包内自带的上游源码之后（源码变了必须重建才生效）。
+    """
     missing = _missing_copy_sources()
     if missing:
         rep.log('构建预检未通过：Dockerfile 引用了不存在的文件', 'error')
@@ -512,14 +675,6 @@ def update_upstream(rep: Reporter) -> None:
         rep.log('上游已就绪')
     else:
         rep.log('上游未在预期时间内就绪，请查看容器日志', 'warn')
-
-    # 7) 清版本检测缓存
-    #
-    # 缓存里存的是「更新前」查到的远端最新提交；不清的话，界面会把**已经装好的
-    # 这个版本**当成新版本继续提示「上游有更新」，一直到缓存 6 小时过期为止
-    # （用户报过这个问题：明明更新到最新了，面板还是一直说有更新）。
-    # 管理端更新那条路径早就清了，上游这条一直漏着。
-    _clear_version_cache(rep)
 
 
 def _clear_version_cache(rep: Reporter) -> None:
@@ -985,6 +1140,21 @@ def update_manager(rep: Reporter) -> None:
                 shutil.copyfile(src, INSTALL_DIR / name)
                 rep.log(f'同步 {name}')
 
+        # ── 上游源码随包更新 ─────────────────────────────────────────
+        # 上游仓库的公开地址已不可用，源码随本项目的发布包分发（包内 upstream/）。放在这里
+        # 而不是 update_upstream 里另下一份，是因为**本包是验过签的**：上游代码
+        # 由此落在签名信任链内；另下一份则没有这层保证。
+        # 只有真的改动了才重建容器——上游源码在两版之间多数没变，白重建一次要等
+        # 好几分钟，还会把上游短暂停掉。
+        changed = _sync_bundled_upstream(new_root / 'upstream', rep)
+        if changed:
+            # 包内那份 compose 是**上游原样**（`7863:7863`，公网可达），而端口收敛
+            # 是在 update_upstream 里做的——那一步在本函数之前。同步会把它盖掉，
+            # 所以这里必须**重新施加**安全基线，否则上游会重新暴露到 0.0.0.0。
+            enforce_local_bind(rep)
+            rep.log('上游源码有变化，重建容器使其生效…')
+            rebuild_upstream(rep)
+
     # 4) 依赖有变化则重装
     req = INSTALL_DIR / 'server' / 'requirements.txt'
     if req.is_file():
@@ -1053,6 +1223,13 @@ def restart_service(rep: Reporter) -> None:
         rep.log('（容器无法自我重启；compose 的 restart 策略会在进程退出后')
         rep.log('  用新代码重新启动。若长时间未恢复，请在宿主机执行：')
         rep.log('  docker compose restart workbuddy-manager）')
+        return
+    if os.name == 'nt':
+        # Windows 原生部署（deploy/windows-native）：没有 systemd，也不该在这里
+        # 报一次「systemctl 重启失败」——那时新代码其实已经就位，用户看到的却是一次
+        # 失败的更新（还可能去查一个 Windows 上根本不存在的服务）。如实说明怎么做。
+        rep.log('Windows 原生部署：新代码已就位。请关闭当前面板窗口，'
+                '重新执行启动脚本（start-workbuddy-manager.cmd）。')
         return
     rc, _ = run(['systemctl', 'restart', SERVICE_NAME], rep=rep, check=False)
     if rc != 0:
@@ -1165,9 +1342,22 @@ def main() -> int:
             update_upstream(rep)
         if args.target in ('manager', 'both'):
             update_manager(rep)
-    except Exception as exc:  # noqa: BLE001
-        rep.log(f'更新失败：{exc}', 'error')
+    except BaseException as exc:  # noqa: BLE001
+        # KeyboardInterrupt（控制台 Ctrl+C/关窗）、SystemExit 等 BaseException
+        # 也要捕获并留下终态：只捕 Exception 的话中断会直接穿出去，
+        # 状态文件永远停在 running=true，前端就永远等不到「更新未完成」的
+        # 结束信号，一直显示「正在更新：执行中」。
+        if isinstance(exc, KeyboardInterrupt):
+            rep.log('更新被中断（收到 Ctrl+C / 控制台关闭信号）', 'error')
+        else:
+            rep.log(f'更新失败：{exc}', 'error')
         ok = False
+    finally:
+        # 收尾兜底：任何退出路径都必须把终态落盘。正常成功路径已在
+        # update_manager 内 rep.finish(True) 写过（running=false），这里
+        # 幂等跳过；其余情形（含中断）在此补写 ok=false，绝不留悬空状态。
+        if rep.state.get('running'):
+            rep.finish(ok)
 
     rep.log('更新完成' if ok else '更新未完成，请检查上方日志')
     rep.finish(ok)

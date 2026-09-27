@@ -139,6 +139,12 @@ class RestartBehaviorTest(unittest.TestCase):
 
         with mock.patch.object(mod, 'run', side_effect=lambda cmd, **k: (calls.append(cmd), (0, ''))[1]):
             mod.restart_service(Rep())
+        if os.name == 'nt':
+            # Windows 没有 systemd，宿主形态在这里走的是 Windows 分支（如实提示
+            # 「新代码已就位，重启面板」）—— 调用一个不存在的命令会让本来已经成功的
+            # 更新被判成失败。该分支的细则见 test_update_lifecycle.RestartStepOnWindows。
+            self.assertEqual(calls, [], f'Windows 上不该执行任何命令，实际：{calls}')
+            return
         self.assertTrue(any('systemctl' in c for c in calls),
                         f'宿主形态应调用 systemctl，实际：{calls}')
 
@@ -579,6 +585,23 @@ class DockerAssetsTest(unittest.TestCase):
         self.assertRegex(df, r'(?m)^ARG\s+NPM_REGISTRY',
                          'Dockerfile 未声明 NPM_REGISTRY —— compose 传了也会被忽略')
 
+    def test_compose_passes_mirror_and_base_path_args(self) -> None:
+        """镜像里的两个国外下载源、以及子路径前缀，同样要 compose ↔ Dockerfile 对齐。
+
+        这类「可选开关」最容易出的错法不是写坏，而是**只加了一边**：compose 里
+        列了参数、Dockerfile 却没声明同名 ARG —— docker 对多余的 build-arg 只是
+        忽略，于是用户填了值、构建照样卡在 download.docker.com / GitHub 上，
+        而且没有任何报错。这条与上面的 NPM_REGISTRY 同款。
+        """
+        import yaml
+        dc = yaml.safe_load((_ROOT / 'docker-compose.yml').read_text(encoding='utf-8'))
+        args = (dc['services']['workbuddy-manager'].get('build') or {}).get('args') or {}
+        df = (_ROOT / 'Dockerfile').read_text(encoding='utf-8')
+        for name in ('DOCKER_CLI_BASE', 'COMPOSE_URL_PREFIX', 'BASE_PATH'):
+            self.assertIn(name, args, f'compose 没有暴露 {name}')
+            self.assertRegex(df, rf'(?m)^ARG\s+{name}',
+                             f'Dockerfile 未声明 {name} —— compose 传了也会被忽略')
+
     def test_dockerfile_structure_checker_passes(self) -> None:
         """跑一遍 Dockerfile 结构自检（指令拼写 / 阶段引用 / shell 配平）。
 
@@ -873,3 +896,104 @@ class ForkImageWorkflowTest(unittest.TestCase):
         tags_block = tags_block[:tags_block.find('provenance')]
         self.assertNotIn('github.repository_owner', tags_block,
                          'tags 里直接用了 repository_owner（含大写）—— 应改用转小写后的输出')
+
+
+class UpstreamSourceFallbackTest(unittest.TestCase):
+    """上游仓库没了之后的安装路径（install.sh 的 UPSTREAM_SRC）。
+
+    上游原仓库（Sliverkiss/workbuddy2api）自 2026-09-23 起不可访问，克隆那一步对
+    新装用户是死的。脚本因此支持三种本地来源，并且**这是新用户第一次接触本项目
+    时会走的路径**，不能悄悄回归。
+
+    两条断言方式并用：
+      · 源码级：三种来源分支、同目录短路、失败提示的三条退路都在；
+      · 真跑一遍：解压那条分支的参数在真实目录上验证过 ——
+        GitHub 导出的包都带顶层目录，少了 `--strip-components=1` 会把文件散到
+        上一层，docker compose 找不到 Dockerfile（与 Dockerfile 分支的验法同款）。
+    """
+
+    def setUp(self) -> None:
+        self.sh = (_ROOT / 'deploy' / 'install.sh').read_text(encoding='utf-8')
+
+    def test_three_source_shapes_supported(self) -> None:
+        self.assertIn('UPSTREAM_SRC="${UPSTREAM_SRC:-}"', self.sh, '没有 UPSTREAM_SRC 开关')
+        for shape in ('*.tar.gz | *.tgz', '*.zip'):
+            self.assertIn(shape, self.sh, f'缺少 {shape} 分支')
+        self.assertIn('cp -a "$UPSTREAM_SRC"/. "$UPSTREAM_DIR"/', self.sh,
+                      '缺少「本地目录」分支')
+        # 这条必须**盯脚本本身**：下面那条真跑用例验的是「这样解压是对的」，
+        # 脚本里若是漏了这个参数，只跑自己的命令照样绿（第一版就漏在这）。
+        self.assertIn('tar -xzf "$UPSTREAM_SRC" -C "$UPSTREAM_DIR" --strip-components=1',
+                      self.sh, '解压分支少了 --strip-components=1（文件会散在上一层）')
+
+    def test_same_directory_is_short_circuited(self) -> None:
+        """源码本来就在目标目录时不要自己复制自己（复用 /opt/workbuddy2api 的典型情形）。"""
+        self.assertIn('pwd -P', self.sh, '没有做「同一目录」判断')
+
+    def test_bundled_upstream_is_preferred_and_ordered_first(self) -> None:
+        """发布包自带 `upstream/` 时优先用它，且顺序必须在 git/克隆之前。
+
+        上游源码随 Release 包分发（公开仓库不放上游代码），所以「包里有就用包里
+        的」是**新用户第一次安装**会走的路。顺序错了（比如先试 git clone）会让
+        离线机器白等一次超时，最后还可能失败。
+        """
+        self.assertIn('UPSTREAM_DIR}/docker-compose.yml', self.sh,
+                      '没有检测发布包自带的 upstream/')
+        i_bundled = self.sh.index('BUNDLED=')
+        # 用**安装分支里**那个 elif 作锚点：脚本开头还有一处 [ -d .../.git ] 属于
+        # 「已装过上游，只需确保容器在跑」的分支，拿它比会得到错误的先后（试过）。
+        i_git = self.sh.index('elif [ -d "${UPSTREAM_DIR}/.git" ]')
+        self.assertLess(i_bundled, i_git,
+                        '包内自带的源码要排在「已有 git 目录」之前判断')
+        # 检测到之后必须真的接上：赋给 UPSTREAM_SRC（后面复制/解压那段用的就是它）
+        self.assertIn('UPSTREAM_SRC="$BUNDLED"', self.sh,
+                      '检测到了包内源码却没接到 UPSTREAM_SRC —— 等于没检测')
+
+    def test_release_workflow_embeds_upstream_source(self) -> None:
+        """发布流程要把上游源码塞进包里，且**取不到时不阻断发布**。
+
+        上游源码不放进本仓库，所以「随包分发」是用户拿到源码
+        的唯一常规渠道。两步都不能少：
+          · 从固定的载体 Release 取（tag upstream-src，标 pre-release 才行——
+            否则它会成为 releases/latest，把面板的更新检查带偏）；
+          · 取不到只记 warning 继续打包（否则一次网络抖动就让整个发布失败）。
+        """
+        import yaml
+        wf = (_ROOT / '.github' / 'workflows' / 'release.yml').read_text(encoding='utf-8')
+        yaml.safe_load(wf)   # 先确保 YAML 没写坏
+        self.assertIn('releases/download/upstream-src/workbuddy2api-src.tar.gz', wf,
+                      '没有从载体 Release 取上游源码')
+        self.assertIn("$STAGE/upstream", wf, '取回来的源码没有放进发布目录')
+        self.assertIn('::warning::', wf, '取不到源码时会直接失败 —— 应该只告警')
+
+    def test_clone_failure_lists_ways_out(self) -> None:
+        """克隆失败要把三条退路写清楚——否则用户只看到 git 的 not found。"""
+        block = self.sh[self.sh.find('克隆上游仓库失败'):]
+        block = block[:block.find('fi\n') + 3]
+        for hint in ('UPSTREAM_SRC=', 'UPSTREAM_REPO=', '--skip-upstream'):
+            self.assertIn(hint, block, f'失败提示里缺 {hint}')
+
+    def test_tar_strips_top_level_directory(self) -> None:
+        """真跑：把「带顶层目录的源码包」按脚本的方式解开，文件必须落在根上。"""
+        import shutil
+        import subprocess
+        if not shutil.which('tar'):
+            self.skipTest('本机没有 tar')
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / 'pkg' / 'workbuddy2api-abc1234'
+            (src / 'scripts').mkdir(parents=True)
+            (src / 'docker-compose.yml').write_text('services: {}\n', encoding='utf-8')
+            (src / 'scripts' / 'x.py').write_text('', encoding='utf-8')
+            tarball = root / 'upstream.tar.gz'
+            subprocess.run(['tar', '-czf', str(tarball), '-C', str(root / 'pkg'),
+                            'workbuddy2api-abc1234'], check=True)
+            dest = root / 'dest'
+            dest.mkdir()
+            subprocess.run(['tar', '-xzf', str(tarball), '-C', str(dest),
+                            '--strip-components=1'], check=True)
+            self.assertTrue((dest / 'docker-compose.yml').is_file(),
+                            '解压后 docker-compose.yml 不在根目录 —— 少了 --strip-components=1？')
+            self.assertTrue((dest / 'scripts' / 'x.py').is_file(), '子目录内容也应在')
+            self.assertFalse((dest / 'workbuddy2api-abc1234').exists(),
+                             '顶层目录没被剥掉')
